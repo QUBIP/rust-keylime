@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2021 Keylime Authors
 
+use std::mem;
 use crate::common::JsonWrapper;
 use crate::crypto;
 use crate::serialization::serialize_maybe_base64;
 use crate::{tpm, Error as KeylimeError, QuoteData};
-use actix_web::{http, web, HttpRequest, HttpResponse, Responder};
+use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use base64::{engine::general_purpose, Engine as _};
 use log::*;
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,25 @@ use std::{
     io::{Read, Seek},
 };
 use tss_esapi::structures::PcrSlot;
+
+use std::os::raw::{c_char, c_uchar, c_ulong};
+use std::ffi::CString;
+
+#[link(name = "sign_with_sphincs")]
+extern "C" {
+    fn sign_with_sphincs(
+        quote: *const u8,
+        quote_len: usize,
+        pq_priv_key: *const u8,
+        pq_priv_key_len: usize,
+    ) -> SignatureResult;
+}
+
+#[repr(C)]
+struct SignatureResult {
+    signature: *mut c_uchar,
+    signature_len: c_ulong,
+}
 
 #[derive(Deserialize)]
 pub struct Ident {
@@ -44,13 +64,36 @@ pub(crate) struct KeylimeQuote {
     pub ima_measurement_list_entry: Option<u64>,
 }
 
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub(crate) struct PQquote {
+    pub sign_sphincs: Vec<u8>, 
+    pub sign_sphincs_len: c_ulong,
+    pub pq_key: Vec<u8>, 
+    pub pq_key_len: usize,
+    pub hash_alg_sphincs: String,
+    pub quote_len: usize,
+    pub quote: String,              
+    pub hash_alg: String,           
+    pub enc_alg: String,            
+    pub sign_alg: String,           
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,      
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ima_measurement_list: Option<String>, 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mb_measurement_list: Option<String>, 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ima_measurement_list_entry: Option<u64>, 
+}
+
 // This is a Quote request from the tenant, which does not check
 // integrity measurement. It should return this data:
 // { QuoteAIK(nonce, 16:H(NK_pub)), NK_pub }
-async fn identity(
+pub async fn identity(
     req: HttpRequest,
     param: web::Query<Ident>,
-    data: web::Data<QuoteData<'_>>,
+    data: web::Data<QuoteData>,
 ) -> impl Responder {
     // nonce can only be in alphanumerical format
     if !param.nonce.chars().all(char::is_alphanumeric) {
@@ -126,9 +169,54 @@ async fn identity(
         }
     }
 
+      // Conversione del campo quote in CString
+      let quote_ptr: *const u8 = quote.quote.as_ptr() as *const u8;
+
+
+      let pq_priv_key_cstring: *const u8 = data.pq_priv_key.as_ptr();
+
+      // Chiamata alla funzione C
+      let result = unsafe {
+      sign_with_sphincs(quote_ptr, quote.quote.len(),pq_priv_key_cstring,data.pq_priv_key_len) 
+
+      };
+  
+      if !result.signature.is_null() {
+          // Conversione dei puntatori in slice Rust
+          let signature_slice = unsafe { std::slice::from_raw_parts(result.signature, result.signature_len as usize) };
+          let signature_vec = signature_slice.to_vec();
+  
+          
+  
+      let pq_quote = PQquote {
+          sign_sphincs: signature_vec.clone(),
+          sign_sphincs_len: result.signature_len,
+          pq_key: data.pq_pub_key.clone(),
+          pq_key_len: data.pq_pub_key_len,
+          hash_alg_sphincs: "shake_256".to_string(),
+          quote_len: quote.quote.len(),
+          quote: quote.quote,
+          hash_alg: quote.hash_alg,
+          enc_alg: quote.enc_alg,
+          sign_alg: quote.sign_alg,
+          pubkey: quote.pubkey,
+          ima_measurement_list: quote.ima_measurement_list,
+          mb_measurement_list: quote.mb_measurement_list,
+          ima_measurement_list_entry: quote.ima_measurement_list_entry,
+      };
+  
+  
+      let response = JsonWrapper::success(pq_quote);
+      info!("GET integrity quote returning 200 response");
+      HttpResponse::Ok().json(response)
+  }
+
+    else{
+
     let response = JsonWrapper::success(quote);
     info!("GET identity quote returning 200 response");
     HttpResponse::Ok().json(response)
+    }
 }
 
 // This is a Quote request from the cloud verifier, which will check
@@ -136,10 +224,10 @@ async fn identity(
 // by the mask. It should return this data:
 // { QuoteAIK(nonce, 16:H(NK_pub), xi:yi), NK_pub}
 // where xi:yi are additional PCRs to be included in the quote.
-async fn integrity(
+pub async fn integrity(
     req: HttpRequest,
     param: web::Query<Integ>,
-    data: web::Data<QuoteData<'_>>,
+    data: web::Data<QuoteData>,
 ) -> impl Responder {
     // nonce, mask can only be in alphanumerical format
     if !param.nonce.chars().all(char::is_alphanumeric) {
@@ -331,49 +419,63 @@ async fn integrity(
         ..id_quote
     };
 
-    let response = JsonWrapper::success(quote);
+   
+    let quote_ptr: *const u8 = quote.quote.as_ptr() as *const u8;
+    let pq_priv_key_cstring: *const u8 = data.pq_priv_key.as_ptr();
+
+
+    // Chiamata alla funzione C
+    let result = unsafe {
+        sign_with_sphincs(quote_ptr, quote.quote.len(),pq_priv_key_cstring,data.pq_priv_key_len)
+    };
+
+    if !result.signature.is_null() {
+        // Conversione dei puntatori in slice Rust
+        let signature_slice = unsafe { std::slice::from_raw_parts(result.signature, result.signature_len as usize) };
+
+        let signature_vec = signature_slice.to_vec();
+
+         // Dealloca la memoria in C
+         unsafe {
+            libc::free(result.signature as *mut libc::c_void);
+        }
+
+    let pq_quote = PQquote {
+        sign_sphincs: signature_vec.clone(),
+        sign_sphincs_len: result.signature_len,
+        pq_key: data.pq_pub_key.clone(),
+        pq_key_len: data.pq_pub_key_len,
+        hash_alg_sphincs: "shake_256".to_string(),
+        quote_len: quote.quote.len(),
+        quote: quote.quote,
+        hash_alg: quote.hash_alg,
+        enc_alg: quote.enc_alg,
+        sign_alg: quote.sign_alg,
+        pubkey: quote.pubkey,
+        ima_measurement_list: quote.ima_measurement_list,
+        mb_measurement_list: quote.mb_measurement_list,
+        ima_measurement_list_entry: quote.ima_measurement_list_entry,
+    };
+
+
+    // Printing each field
+    // info!("Size of quote = {} bytes", size_of::<PQquote>().to_string());
+    info!("Size of sphincs PQ signature = {} bytes", pq_quote.sign_sphincs_len.to_string());
+    info!("PQ Key Length = {} bytes", pq_quote.pq_key_len.to_string());
+    info!("Hash Algorithm (Sphincs) = {}", pq_quote.hash_alg_sphincs);
+    // info!("Quote Length = {} bytes", pq_quote.quote_len.to_string());
+    let response = JsonWrapper::success(pq_quote);
     info!("GET integrity quote returning 200 response");
+    info!("Send integrity quote to the verifier");
     HttpResponse::Ok().json(response)
 }
 
-/// Handles the default case for the /quotes scope
-async fn quotes_default(req: HttpRequest) -> impl Responder {
-    let error;
-    let response;
-    let message;
+ else {
+    let response = JsonWrapper::success(quote);
+    info!("GET integrity quote returning 200 response");
+    HttpResponse::Ok().json(response)
+    }
 
-    match req.head().method {
-        http::Method::GET => {
-            error = 400;
-            message = "URI not supported, only /identity and /integrity are supported for GET in /quotes/ interface";
-            response = HttpResponse::BadRequest()
-                .json(JsonWrapper::error(error, message));
-        }
-        _ => {
-            error = 405;
-            message = "Method is not supported in /quotes/ interface";
-            response = HttpResponse::MethodNotAllowed()
-                .insert_header(http::header::Allow(vec![http::Method::GET]))
-                .json(JsonWrapper::error(error, message));
-        }
-    };
-
-    warn!(
-        "{} returning {} response. {}",
-        req.head().method,
-        error,
-        message
-    );
-
-    response
-}
-
-/// Configure the endpoints for the /quotes scope
-pub(crate) fn configure_quotes_endpoints(cfg: &mut web::ServiceConfig) {
-    _ = cfg
-        .service(web::resource("/identity").route(web::get().to(identity)))
-        .service(web::resource("/integrity").route(web::get().to(integrity)))
-        .default_service(web::to(quotes_default));
 }
 
 #[cfg(feature = "testing")]
@@ -383,12 +485,10 @@ mod tests {
     use crate::common::API_VERSION;
     use actix_web::{test, web, App};
     use keylime::{crypto::testing::pkey_pub_from_pem, tpm};
-    use serde_json::{json, Value};
 
     #[actix_rt::test]
     async fn test_identity() {
-        let (fixture, mutex) = QuoteData::fixture().await.unwrap(); //#[allow_ci]
-        let quotedata = web::Data::new(fixture);
+        let quotedata = web::Data::new(QuoteData::fixture().unwrap()); //#[allow_ci]
         let mut app =
             test::init_service(App::new().app_data(quotedata.clone()).route(
                 &format!("/{API_VERSION}/quotes/identity"),
@@ -419,22 +519,17 @@ mod tests {
 
         let mut context = quotedata.tpmcontext.lock().unwrap(); //#[allow_ci]
         tpm::testing::check_quote(
-            &mut context,
+            context.as_mut(),
             quotedata.ak_handle,
             &result.results.quote,
             b"1234567890ABCDEFHIJ",
         )
         .expect("unable to verify quote");
-
-        // Explicitly drop QuoteData to cleanup keys
-        drop(context);
-        drop(quotedata);
     }
 
     #[actix_rt::test]
     async fn test_integrity_pre() {
-        let (fixture, mutex) = QuoteData::fixture().await.unwrap(); //#[allow_ci]
-        let quotedata = web::Data::new(fixture);
+        let quotedata = web::Data::new(QuoteData::fixture().unwrap()); //#[allow_ci]
         let mut app =
             test::init_service(App::new().app_data(quotedata.clone()).route(
                 &format!("/{API_VERSION}/quotes/integrity"),
@@ -476,7 +571,7 @@ mod tests {
 
                     let mut context = quotedata.tpmcontext.lock().unwrap(); //#[allow_ci]
                     tpm::testing::check_quote(
-                        &mut context,
+                        context.as_mut(),
                         quotedata.ak_handle,
                         &result.results.quote,
                         b"1234567890ABCDEFHIJ",
@@ -488,15 +583,11 @@ mod tests {
         } else {
             panic!("IMA file was None"); //#[allow_ci]
         }
-
-        // Explicitly drop QuoteData to cleanup keys
-        drop(quotedata);
     }
 
     #[actix_rt::test]
     async fn test_integrity_post() {
-        let (fixture, mutex) = QuoteData::fixture().await.unwrap(); //#[allow_ci]
-        let quotedata = web::Data::new(fixture);
+        let quotedata = web::Data::new(QuoteData::fixture().unwrap()); //#[allow_ci]
         let mut app =
             test::init_service(App::new().app_data(quotedata.clone()).route(
                 &format!("/{API_VERSION}/quotes/integrity"),
@@ -539,27 +630,22 @@ mod tests {
 
         let mut context = quotedata.tpmcontext.lock().unwrap(); //#[allow_ci]
         tpm::testing::check_quote(
-            &mut context,
+            context.as_mut(),
             quotedata.ak_handle,
             &result.results.quote,
             b"1234567890ABCDEFHIJ",
         )
         .expect("unable to verify quote");
-
-        // Explicitly drop QuoteData to cleanup keys
-        drop(context);
-        drop(quotedata);
     }
 
     #[actix_rt::test]
     async fn test_missing_ima_file() {
-        let (mut fixture, mutex) = QuoteData::fixture().await.unwrap(); //#[allow_ci]
-
-        // Remove the IMA log file from the context
-        fixture.ima_ml_file = None;
-        let quotedata = web::Data::new(fixture);
+        let mut quotedata = QuoteData::fixture().unwrap(); //#[allow_ci]
+                                                           // Remove the IMA log file from the context
+        quotedata.ima_ml_file = None;
+        let data = web::Data::new(quotedata);
         let mut app =
-            test::init_service(App::new().app_data(quotedata.clone()).route(
+            test::init_service(App::new().app_data(data.clone()).route(
                 &format!("/{API_VERSION}/quotes/integrity"),
                 web::get().to(integrity),
             ))
@@ -578,41 +664,5 @@ mod tests {
             test::read_body_json(resp).await;
         assert!(result.results.ima_measurement_list.is_none());
         assert!(result.results.ima_measurement_list_entry.is_none());
-
-        // Explicitly drop QuoteData to cleanup keys
-        drop(quotedata);
-    }
-
-    #[actix_rt::test]
-    async fn test_keys_default() {
-        let mut app = test::init_service(
-            App::new().service(web::resource("/").to(quotes_default)),
-        )
-        .await;
-
-        let req = test::TestRequest::get().uri("/").to_request();
-
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_client_error());
-
-        let result: JsonWrapper<Value> = test::read_body_json(resp).await;
-
-        assert_eq!(result.results, json!({}));
-        assert_eq!(result.code, 400);
-
-        let req = test::TestRequest::delete().uri("/").to_request();
-
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_client_error());
-
-        let headers = resp.headers();
-
-        assert!(headers.contains_key("allow"));
-        assert_eq!(headers.get("allow").unwrap().to_str().unwrap(), "GET"); //#[allow_ci]
-
-        let result: JsonWrapper<Value> = test::read_body_json(resp).await;
-
-        assert_eq!(result.results, json!({}));
-        assert_eq!(result.code, 405);
     }
 }

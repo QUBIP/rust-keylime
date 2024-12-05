@@ -1194,7 +1194,6 @@ dependencies = [
  "static_assertions",
  "tempfile",
  "thiserror",
- "tokio",
  "tss-esapi",
 ]
 

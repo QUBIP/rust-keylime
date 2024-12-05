@@ -7,6 +7,23 @@ use openssl::x509::X509;
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
 use std::net::IpAddr;
+use base64::Engine;
+
+// use std::os::raw::c_uchar;
+// use libc::size_t as c_size_t;
+// use std::ptr;
+
+// #[link(name = "genpqkey")]
+// extern "C" {
+//     fn generate_sphincs_keypair() -> KeypairResult;
+// }
+
+
+// #[repr(C)]
+// struct KeypairResult {
+//     public_key: *mut c_uchar,
+//     public_key_len: c_size_t,
+// }
 
 fn is_empty(buf: &[u8]) -> bool {
     buf.is_empty()
@@ -53,6 +70,7 @@ struct Register<'a> {
     ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     port: Option<u32>,
+    pq_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -144,6 +162,7 @@ pub(crate) async fn do_register_agent(
     mtls_cert_x509: Option<&X509>,
     ip: &str,
     port: u32,
+    pq_key: String,
 ) -> crate::error::Result<Vec<u8>> {
     let mtls_cert = match mtls_cert_x509 {
         Some(cert) => Some(crate::crypto::x509_to_pem(cert)?),
@@ -179,7 +198,13 @@ pub(crate) async fn do_register_agent(
         mtls_cert,
         ip,
         port: Some(port),
+        pq_key: pq_key.clone(),
     };
+
+    info!("Send PQ public key to the registrar \n");
+    // println!("Begin PQ Public KEY (Base64 encoded)-----");
+    // println!("{}", pq_key.clone());
+    // println!("-----End PQ Public KEY");
 
     let remote_ip = match registrar_ip.parse::<IpAddr>() {
         Ok(addr) => {

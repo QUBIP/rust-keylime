@@ -11,7 +11,7 @@ use crate::{
     payloads::{Payload, PayloadMessage},
     Error, QuoteData, Result,
 };
-use actix_web::{http, web, HttpRequest, HttpResponse, Responder};
+use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use base64::{engine::general_purpose, Engine as _};
 use log::*;
 use serde::{Deserialize, Serialize};
@@ -130,10 +130,10 @@ fn try_combine_keys(
     None
 }
 
-async fn u_key(
+pub(crate) async fn u_key(
     body: web::Json<KeylimeUKey>,
     req: HttpRequest,
-    quote_data: web::Data<QuoteData<'_>>,
+    quote_data: web::Data<QuoteData>,
 ) -> impl Responder {
     debug!("Received ukey");
 
@@ -244,10 +244,10 @@ async fn u_key(
     HttpResponse::Ok().json(JsonWrapper::success(()))
 }
 
-async fn v_key(
+pub(crate) async fn v_key(
     body: web::Json<KeylimeVKey>,
     req: HttpRequest,
-    quote_data: web::Data<QuoteData<'_>>,
+    quote_data: web::Data<QuoteData>,
 ) -> impl Responder {
     debug!("Received vkey");
 
@@ -315,9 +315,9 @@ async fn v_key(
     HttpResponse::Ok().json(JsonWrapper::success(()))
 }
 
-async fn pubkey(
+pub(crate) async fn pubkey(
     req: HttpRequest,
-    data: web::Data<QuoteData<'_>>,
+    data: web::Data<QuoteData>,
 ) -> impl Responder {
     match crypto::pkey_pub_to_pem(&data.pub_key) {
         Ok(pubkey) => {
@@ -364,10 +364,10 @@ async fn get_symm_key(
     }
 }
 
-async fn verify(
+pub(crate) async fn verify(
     param: web::Query<KeylimeChallenge>,
     req: HttpRequest,
-    data: web::Data<QuoteData<'_>>,
+    data: web::Data<QuoteData>,
 ) -> impl Responder {
     if param.challenge.is_empty() {
         warn!(
@@ -544,57 +544,6 @@ pub(crate) async fn worker(
     Ok(())
 }
 
-/// Handles the default case for the /keys scope
-async fn keys_default(req: HttpRequest) -> impl Responder {
-    let error;
-    let response;
-    let message;
-
-    match req.head().method {
-        http::Method::GET => {
-            error = 400;
-            message = "URI not supported, only /pubkey and /verify are supported for GET in /keys interface";
-            response = HttpResponse::BadRequest()
-                .json(JsonWrapper::error(error, message));
-        }
-        http::Method::POST => {
-            error = 400;
-            message = "URI not supported, only /ukey and /vkey are supported for POST in /keys interface";
-            response = HttpResponse::BadRequest()
-                .json(JsonWrapper::error(error, message));
-        }
-        _ => {
-            error = 405;
-            message = "Method is not supported in /keys interface";
-            response = HttpResponse::MethodNotAllowed()
-                .insert_header(http::header::Allow(vec![
-                    http::Method::GET,
-                    http::Method::POST,
-                ]))
-                .json(JsonWrapper::error(error, message));
-        }
-    };
-
-    warn!(
-        "{} returning {} response. {}",
-        req.head().method,
-        error,
-        message
-    );
-
-    response
-}
-
-/// Configure the endpoints for the /keys scope
-pub(crate) fn configure_keys_endpoints(cfg: &mut web::ServiceConfig) {
-    _ = cfg
-        .service(web::resource("/pubkey").route(web::get().to(pubkey)))
-        .service(web::resource("/ukey").route(web::post().to(u_key)))
-        .service(web::resource("/verify").route(web::get().to(verify)))
-        .service(web::resource("/vkey").route(web::post().to(v_key)))
-        .default_service(web::to(keys_default));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,7 +567,6 @@ mod tests {
         rsa::Padding,
         sign::Signer,
     };
-    use serde_json::{json, Value};
     use std::{
         env, fs,
         path::{Path, PathBuf},
@@ -823,59 +771,10 @@ mod tests {
         }
     }
 
-    #[actix_rt::test]
-    async fn test_keys_default() {
-        let mut app = test::init_service(
-            App::new().service(web::resource("/").to(keys_default)),
-        )
-        .await;
-
-        let req = test::TestRequest::get().uri("/").to_request();
-
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_client_error());
-
-        let result: JsonWrapper<Value> = test::read_body_json(resp).await;
-
-        assert_eq!(result.results, json!({}));
-        assert_eq!(result.code, 400);
-
-        let req = test::TestRequest::post()
-            .uri("/")
-            .data("some data")
-            .to_request();
-
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_client_error());
-
-        let result: JsonWrapper<Value> = test::read_body_json(resp).await;
-
-        assert_eq!(result.results, json!({}));
-        assert_eq!(result.code, 400);
-
-        let req = test::TestRequest::delete().uri("/").to_request();
-
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_client_error());
-
-        let headers = resp.headers();
-
-        assert!(headers.contains_key("allow"));
-        assert_eq!(
-            headers.get("allow").unwrap().to_str().unwrap(), //#[allow_ci]
-            "GET, POST"
-        );
-
-        let result: JsonWrapper<Value> = test::read_body_json(resp).await;
-
-        assert_eq!(result.results, json!({}));
-        assert_eq!(result.code, 405);
-    }
-
     #[cfg(feature = "testing")]
     async fn test_u_or_v_key(key_len: usize, payload: Option<&[u8]>) {
         let test_config = KeylimeConfig::default();
-        let (mut fixture, mutex) = QuoteData::fixture().await.unwrap(); //#[allow_ci]
+        let mut fixture = QuoteData::fixture().unwrap(); //#[allow_ci]
 
         // Create temporary working directory and secure mount
         let temp_workdir = tempfile::tempdir().unwrap(); //#[allow_ci]
@@ -1073,9 +972,6 @@ mod tests {
         keys_tx.send((KeyMessage::Shutdown, None)).await.unwrap(); //#[allow_ci]
         payload_tx.send(PayloadMessage::Shutdown).await.unwrap(); //#[allow_ci]
         arbiter.join();
-
-        // Explicitly drop QuoteData to cleanup keys
-        drop(quotedata);
     }
 
     #[cfg(feature = "testing")]
@@ -1093,8 +989,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[actix_rt::test]
     async fn test_pubkey() {
-        let (fixture, mutex) = QuoteData::fixture().await.unwrap(); //#[allow_ci]
-        let quotedata = web::Data::new(fixture);
+        let quotedata = web::Data::new(QuoteData::fixture().unwrap()); //#[allow_ci]
         let mut app =
             test::init_service(App::new().app_data(quotedata.clone()).route(
                 &format!("/{API_VERSION}/keys/pubkey"),
@@ -1114,8 +1009,5 @@ mod tests {
         assert!(pkey_pub_from_pem(&result.results.pubkey)
             .unwrap() //#[allow_ci]
             .public_eq(&quotedata.pub_key));
-
-        // Explicitly drop QuoteData to cleanup keys
-        drop(quotedata);
     }
 }

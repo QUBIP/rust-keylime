@@ -76,17 +76,15 @@ fn setup_unzipped(
     }
 
     match config.agent.dec_payload_file.as_ref() {
-        "" => Err(config::KeylimeConfigError::RequiredOption(
-            "dec_payload_path".to_string(),
-        )
-        .into()),
+        "" => Err(Error::Configuration(
+            "The dec_payload_path option was not set".to_string(),
+        )),
         p => {
             let dec_payload_path = unzipped.join(p);
             match config.agent.enc_keyname.as_ref() {
-                "" => Err(config::KeylimeConfigError::RequiredOption(
-                    "enc_keyname".to_string(),
-                )
-                .into()),
+                "" => Err(Error::Configuration(
+                    "The enc_keyname option was not set".to_string(),
+                )),
                 k => {
                     let key_path = unzipped.join(k);
                     fs::create_dir(&unzipped)?;

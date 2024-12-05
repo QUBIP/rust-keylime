@@ -6,12 +6,9 @@ use crate::algorithms::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use log::*;
-use std::{
-    convert::{TryFrom, TryInto},
-    io::Read,
-    str::FromStr,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::convert::{TryFrom, TryInto};
+use std::io::Read;
+use std::str::FromStr;
 use thiserror::Error;
 
 use openssl::{
@@ -36,7 +33,7 @@ use tss_esapi::{
     },
     handles::{
         AuthHandle, KeyHandle, ObjectHandle, PcrHandle, PersistentTpmHandle,
-        SessionHandle, TpmHandle,
+        TpmHandle,
     },
     interface_types::{
         algorithm::{AsymmetricAlgorithm, HashingAlgorithm, PublicAlgorithm},
@@ -53,7 +50,7 @@ use tss_esapi::{
         PcrSelectionListBuilder, PcrSlot, PublicBuilder,
         PublicEccParametersBuilder, PublicKeyRsa, PublicRsaParametersBuilder,
         RsaExponent, RsaScheme, Signature, SignatureScheme,
-        SymmetricDefinitionObject, Ticket, VerifiedTicket,
+        SymmetricDefinitionObject,
     },
     tcti_ldr::TctiNameConf,
     traits::Marshall,
@@ -129,10 +126,6 @@ pub enum TpmError {
     /// Error loading AK object
     #[error("Error loading AK object")]
     TSSLoadAKError { source: tss_esapi::Error },
-
-    /// Error flushing object handle
-    #[error("Error flushing object handle")]
-    TSSFlushContext { source: tss_esapi::Error },
 
     /// Error creating new persistent TPM handle
     #[error("Error creating handle for persistent TPM object in {handle}")]
@@ -227,10 +220,6 @@ pub enum TpmError {
     #[error("Error setting authentication session attributes")]
     TSSSessionSetAttributesError { source: tss_esapi::Error },
 
-    /// Error setting authentication to object handle
-    #[error("Error setting authentication to object handle")]
-    TSSTrSetAuth { source: tss_esapi::Error },
-
     /// Error converting to TSS Digest from digest value
     #[error("Error converting to TSS Digest from digest value")]
     TSSDigestFromValue { source: tss_esapi::Error },
@@ -254,10 +243,6 @@ pub enum TpmError {
     /// Error generating quote
     #[error("Error generating quote")]
     TSSQuoteError { source: tss_esapi::Error },
-
-    /// Error verifying signature
-    #[error("Error verifying signature")]
-    TSSVerifySign { source: tss_esapi::Error },
 
     /// Unexpected attested type in quote
     #[error("Unexpected attested type in quote: expected {expected:?} got {got:?}")]
@@ -468,13 +453,23 @@ pub struct IAKPublic {
 
 /// Wrapper around tss_esapi::Context.
 #[derive(Debug)]
-pub struct Context<'a> {
-    inner: &'a Arc<Mutex<tss_esapi::Context>>,
+pub struct Context {
+    inner: tss_esapi::Context,
 }
 
-static TPM_CTX: OnceLock<Arc<Mutex<tss_esapi::Context>>> = OnceLock::new();
+impl AsRef<tss_esapi::Context> for Context {
+    fn as_ref(&self) -> &tss_esapi::Context {
+        &self.inner
+    }
+}
 
-impl<'a> Context<'a> {
+impl AsMut<tss_esapi::Context> for Context {
+    fn as_mut(&mut self) -> &mut tss_esapi::Context {
+        &mut self.inner
+    }
+}
+
+impl Context {
     /// Creates a connection context.
     pub fn new() -> Result<Self> {
         let tcti_path = match std::env::var("TCTI") {
@@ -493,28 +488,11 @@ impl<'a> Context<'a> {
                 source: error,
             }
         })?;
-
-        let ctx = TPM_CTX.get_or_init(||
-        {
-            let mut tpmctx = tss_esapi::Context::new(tcti).map_err(|error| {
-                TpmError::TSSTctiContextError { source: error }}).expect("Failed to create TPM context");
-
-            //  Retrieve the TPM Vendor, this allows us to warn if someone is using a
-            // Software TPM ("SW")
-            if tss_esapi::utils::get_tpm_vendor(&mut tpmctx).unwrap().contains("SW") { //#[allow_ci]
-                warn!("INSECURE: Keylime is currently using a software TPM emulator rather than a real hardware TPM.");
-                warn!("INSECURE: The security of Keylime is NOT linked to a hardware root of trust.");
-                warn!("INSECURE: Only use Keylime in this mode for testing or debugging purposes.");
-            }
-
-            Arc::new(Mutex::new(tpmctx))
-        });
-
-        Ok(Self { inner: ctx })
-    }
-
-    pub fn inner(self) -> Arc<Mutex<tss_esapi::Context>> {
-        Arc::clone(self.inner)
+        Ok(Self {
+            inner: tss_esapi::Context::new(tcti).map_err(|error| {
+                TpmError::TSSTctiContextError { source: error }
+            })?,
+        })
     }
 
     // Tries to parse the EK certificate and re-encodes it to remove potential padding
@@ -541,16 +519,16 @@ impl<'a> Context<'a> {
         alg: EncryptionAlgorithm,
         handle: Option<&str>,
     ) -> Result<EKResult> {
-        let mut ctx = self.inner.lock().unwrap(); //#[allow_ci]
-
         // Retrieve EK handle, EK pub cert, and TPM pub object
-        let key_handle: KeyHandle = match handle {
+        let key_handle = match handle {
             Some(v) => {
                 if v.is_empty() {
-                    ek::create_ek_object(&mut ctx, alg.into(), DefaultKey)
-                        .map_err(|source| TpmError::TSSCreateEKError {
-                            source,
-                        })?
+                    ek::create_ek_object(
+                        &mut self.inner,
+                        alg.into(),
+                        DefaultKey,
+                    )
+                    .map_err(|source| TpmError::TSSCreateEKError { source })?
                 } else {
                     let handle =
                         u32::from_str_radix(v.trim_start_matches("0x"), 16)
@@ -558,29 +536,33 @@ impl<'a> Context<'a> {
                             origin: v.to_string(),
                             source,
                         })?;
-
-                    ctx.tr_from_tpm_public(TpmHandle::Persistent(
-                        PersistentTpmHandle::new(handle).map_err(
-                            |source| TpmError::TSSNewPersistentHandleError {
+                    self.inner
+                        .tr_from_tpm_public(TpmHandle::Persistent(
+                            PersistentTpmHandle::new(handle).map_err(
+                                |source| {
+                                    TpmError::TSSNewPersistentHandleError {
+                                        handle: v.to_string(),
+                                        source,
+                                    }
+                                },
+                            )?,
+                        ))
+                        .map_err(|source| {
+                            TpmError::TSSHandleFromPersistentHandleError {
                                 handle: v.to_string(),
                                 source,
-                            },
-                        )?,
-                    ))
-                    .map_err(|source| {
-                        TpmError::TSSHandleFromPersistentHandleError {
-                            handle: v.to_string(),
-                            source,
-                        }
-                    })?
-                    .into()
+                            }
+                        })?
+                        .into()
                 }
             }
-            None => ek::create_ek_object(&mut ctx, alg.into(), DefaultKey)
-                .map_err(|source| TpmError::TSSCreateEKError { source })?,
+            None => {
+                ek::create_ek_object(&mut self.inner, alg.into(), DefaultKey)
+                    .map_err(|source| TpmError::TSSCreateEKError { source })?
+            }
         };
-
-        let cert = match ek::retrieve_ek_pubcert(&mut ctx, alg.into()) {
+        let cert = match ek::retrieve_ek_pubcert(&mut self.inner, alg.into())
+        {
             Ok(cert) => match self.check_ek_cert(&cert) {
                 Ok(cert_checked) => Some(cert_checked),
                 Err(_) => {
@@ -593,8 +575,8 @@ impl<'a> Context<'a> {
                 None
             }
         };
-
-        let (tpm_pub, _, _) = ctx
+        let (tpm_pub, _, _) = self
+            .inner
             .read_public(key_handle)
             .map_err(|source| TpmError::TSSReadPublicError { source })?;
         Ok(EKResult {
@@ -620,7 +602,7 @@ impl<'a> Context<'a> {
         sign_alg: SignAlgorithm,
     ) -> Result<AKResult> {
         let ak = ak::create_ak(
-            &mut self.inner.lock().unwrap(), //#[allow_ci]
+            &mut self.inner,
             handle,
             hash_alg.into(),
             sign_alg.into(),
@@ -650,7 +632,7 @@ impl<'a> Context<'a> {
         ak: &AKResult,
     ) -> Result<KeyHandle> {
         let ak_handle = ak::load_ak(
-            &mut self.inner.lock().unwrap(), //#[allow_ci]
+            &mut self.inner,
             handle,
             None,
             ak.private.clone(),
@@ -674,13 +656,13 @@ impl<'a> Context<'a> {
         handle: &str,
         password: &str,
     ) -> Result<KeyHandle> {
-        let mut ctx = self.inner.lock().unwrap(); //#[allow_ci]
         let handle = u32::from_str_radix(handle.trim_start_matches("0x"), 16)
             .map_err(|source| TpmError::NumParse {
                 origin: handle.to_string(),
                 source,
             })?;
-        let key_handle: KeyHandle = ctx
+        let key_handle: KeyHandle = self
+            .inner
             .tr_from_tpm_public(TpmHandle::Persistent(
                 PersistentTpmHandle::new(handle).map_err(|source| {
                     TpmError::TSSNewPersistentHandleError {
@@ -708,12 +690,12 @@ impl<'a> Context<'a> {
             } else {
                 Auth::try_from(password.as_bytes())?
             };
-            ctx.tr_set_auth(key_handle.into(), auth).map_err(|source| {
-                TpmError::TSSHandleSetAuthError {
+            self.as_mut().tr_set_auth(key_handle.into(), auth).map_err(
+                |source| TpmError::TSSHandleSetAuthError {
                     handle: handle.to_string(),
                     source,
-                }
-            })?;
+                },
+            )?;
         };
 
         Ok(key_handle)
@@ -728,8 +710,6 @@ impl<'a> Context<'a> {
         let idevid_handle = self.get_key_handle(handle, password)?;
         let (idevid_pub, _, _) = self
             .inner
-            .lock()
-            .unwrap() //#[allow_ci]
             .read_public(idevid_handle)
             .map_err(|source| TpmError::TSSReadPublicError { source })?;
         Ok(IDevIDResult {
@@ -747,8 +727,6 @@ impl<'a> Context<'a> {
         let iak_handle = self.get_key_handle(handle, password)?;
         let (iak_pub, _, _) = self
             .inner
-            .lock()
-            .unwrap() //#[allow_ci]
             .read_public(iak_handle)
             .map_err(|source| TpmError::TSSReadPublicError { source })?;
         Ok(IAKResult {
@@ -788,8 +766,6 @@ impl<'a> Context<'a> {
 
         let primary_key = self
             .inner
-            .lock()
-            .unwrap() //#[allow_ci]
             .execute_with_nullauth_session(|ctx| {
                 ctx.create_primary(
                     Hierarchy::Endorsement,
@@ -1005,8 +981,6 @@ impl<'a> Context<'a> {
 
         let primary_key = self
             .inner
-            .lock()
-            .unwrap() //#[allow_ci]
             .execute_with_nullauth_session(|ctx| {
                 ctx.create_primary(
                     Hierarchy::Endorsement,
@@ -1195,8 +1169,8 @@ impl<'a> Context<'a> {
         &mut self,
         ses_type: SessionType,
     ) -> Result<AuthSession> {
-        let mut ctx = self.inner.lock().unwrap(); //#[allow_ci]
-        let Some(session) = ctx
+        let Some(session) = self
+            .inner
             .start_auth_session(
                 None,
                 None,
@@ -1219,7 +1193,8 @@ impl<'a> Context<'a> {
             .with_decrypt(true)
             .build();
 
-        ctx.tr_sess_set_attributes(session, ses_attrs, ses_attrs_mask)
+        self.inner
+            .tr_sess_set_attributes(session, ses_attrs, ses_attrs_mask)
             .map_err(|source| TpmError::TSSSessionSetAttributesError {
                 source,
             })?;
@@ -1237,10 +1212,8 @@ impl<'a> Context<'a> {
 
         let ek_auth = self.create_empty_session(SessionType::Policy)?;
 
-        let mut ctx = self.inner.lock().unwrap(); //#[allow_ci]
-
         // We authorize ses2 with PolicySecret(ENDORSEMENT) as per PolicyA
-        let _ = ctx.execute_with_nullauth_session(|context| {
+        let _ = self.inner.execute_with_nullauth_session(|context| {
             context.policy_secret(
                 ek_auth.try_into()?,
                 AuthHandle::Endorsement,
@@ -1251,20 +1224,14 @@ impl<'a> Context<'a> {
             )
         })?;
 
-        let result = ctx
+        self.inner
             .execute_with_sessions(
                 (Some(AuthSession::Password), Some(ek_auth), None),
                 |context| {
                     context.activate_credential(ak, ek, credential, secret)
                 },
             )
-            .map_err(TpmError::from);
-
-        // Clear sessions after use
-        ctx.flush_context(SessionHandle::from(ek_auth).into())?;
-        ctx.clear_sessions();
-
-        result
+            .map_err(TpmError::from)
     }
 
     /// This function certifies an attestation key with the IAK, using any qualifying data provided,
@@ -1275,9 +1242,7 @@ impl<'a> Context<'a> {
         ak: KeyHandle,
         iak: KeyHandle,
     ) -> Result<(Attest, Signature)> {
-        let mut ctx = self.inner.lock().unwrap(); //#[allow_ci]
-
-        let result = ctx
+        self.inner
             .execute_with_sessions(
                 (
                     Some(AuthSession::Password),
@@ -1293,12 +1258,7 @@ impl<'a> Context<'a> {
                     )
                 },
             )
-            .map_err(TpmError::from);
-
-        // Clear sessions after use
-        ctx.clear_sessions();
-
-        result
+            .map_err(TpmError::from)
     }
 
     /// This function extends PCR#16 with the digest, then creates a PcrList
@@ -1310,13 +1270,10 @@ impl<'a> Context<'a> {
         hash_alg: HashingAlgorithm,
     ) -> Result<PcrSelectionList> {
         // extend digest into pcr16
-        self.inner
-            .lock()
-            .unwrap() //#[allow_ci]
-            .execute_with_nullauth_session(|ctx| {
-                ctx.pcr_reset(PcrHandle::Pcr16)?;
-                ctx.pcr_extend(PcrHandle::Pcr16, digest.to_owned())
-            })?;
+        self.inner.execute_with_nullauth_session(|ctx| {
+            ctx.pcr_reset(PcrHandle::Pcr16)?;
+            ctx.pcr_extend(PcrHandle::Pcr16, digest.to_owned())
+        })?;
 
         // translate mask to vec of pcrs
         let mut pcrs = read_mask(mask)?;
@@ -1354,10 +1311,8 @@ impl<'a> Context<'a> {
         let pcrlist =
             self.build_pcr_list(nk_digest, mask, hash_alg.into())?;
 
-        let mut ctx = self.inner.lock().unwrap(); //#[allow_ci]
-
-        let (attestation, sig, pcrs_read, pcr_data) = ctx
-            .execute_with_nullauth_session(|ctx| {
+        let (attestation, sig, pcrs_read, pcr_data) =
+            self.inner.execute_with_nullauth_session(|ctx| {
                 perform_quote_and_pcr_read(
                     ctx,
                     ak_handle,
@@ -1374,8 +1329,6 @@ impl<'a> Context<'a> {
     /// Get the name of the object
     pub fn get_name(&mut self, handle: ObjectHandle) -> Result<Name> {
         self.inner
-            .lock()
-            .unwrap() //#[allow_ci]
             .tr_get_name(handle)
             .map_err(|source| TpmError::TSSGetNameError { source })
     }
@@ -1398,8 +1351,6 @@ impl<'a> Context<'a> {
     ) -> Result<Vec<u8>> {
         let (credential, secret) = self
             .inner
-            .lock()
-            .unwrap() //#[allow_ci]
             .make_credential(ek_handle, credential, name)
             .map_err(|source| TpmError::TSSMakeCredentialError { source })?;
 
@@ -1423,57 +1374,6 @@ impl<'a> Context<'a> {
         blob.extend(secret.as_slice());
 
         Ok(blob)
-    }
-
-    /// Flush object handle context
-    ///
-    /// # Arguments:
-    ///
-    /// * handle (ObjectHandle): The object handle to flush
-    pub fn flush_context(&mut self, handle: ObjectHandle) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap() //#[allow_ci]
-            .flush_context(handle)
-            .map_err(|source| TpmError::TSSFlushContext { source })
-    }
-
-    /// Set authentication to object handle
-    ///
-    /// # Arguments:
-    ///
-    /// * handle (ObjectHandle): Object handle
-    /// * auth (Auth): Authentication to set to the handle
-    pub fn tr_set_auth(
-        &mut self,
-        handle: ObjectHandle,
-        auth: Auth,
-    ) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap() //#[allow_ci]
-            .tr_set_auth(handle, auth)
-            .map_err(|source| TpmError::TSSTrSetAuth { source })
-    }
-
-    /// Verify signature
-    ///
-    /// # Arguments:
-    ///
-    /// * key_handle (KeyHandle): The public key handle
-    /// * digest (Digest): The signed Digest
-    /// * signature (Signature): The signature to verify
-    pub fn verify_signature(
-        &mut self,
-        key_handle: KeyHandle,
-        digest: Digest,
-        signature: Signature,
-    ) -> Result<VerifiedTicket> {
-        self.inner
-            .lock()
-            .unwrap() //#[allow_ci]
-            .verify_signature(key_handle, digest, signature)
-            .map_err(|source| TpmError::TSSVerifySign { source })
     }
 }
 
@@ -1913,19 +1813,18 @@ pub fn get_idevid_template(
 
 pub mod testing {
     use super::*;
-    #[cfg(feature = "testing")]
-    use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+    use std::io::prelude::*;
     use tss_esapi::{
         constants::structure_tags::StructureTag,
-        structures::{Attest, AttestBuffer, DigestList},
+        structures::{Attest, AttestBuffer, DigestList, Ticket},
         tss2_esys::{
             Tss2_MU_TPMT_SIGNATURE_Unmarshal, TPM2B_ATTEST, TPM2B_DIGEST,
             TPMS_PCR_SELECTION, TPMT_SIGNATURE,
         },
     };
 
-    #[cfg(feature = "testing")]
-    pub static MUTEX: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    #[cfg(test)]
+    use std::{fs::File, io::BufReader, path::Path};
 
     macro_rules! create_unmarshal_fn {
         ($func:ident, $tpmobj:ty, $unmarshal:ident) => {
@@ -1956,15 +1855,6 @@ pub mod testing {
         TPMT_SIGNATURE,
         Tss2_MU_TPMT_SIGNATURE_Unmarshal
     );
-
-    /// Initialize testing mutex
-    #[cfg(feature = "testing")]
-    pub async fn lock_tests<'a>() -> AsyncMutexGuard<'a, ()> {
-        MUTEX
-            .get_or_init(|| Arc::new(AsyncMutex::new(())))
-            .lock()
-            .await
-    }
 
     /// Deserialize a TPML_PCR_SELECTION from a &[u8] slice.
     /// The deserialization will adjust the data endianness as necessary.
@@ -2113,7 +2003,7 @@ pub mod testing {
         Ok((pcrlist, pcrdata))
     }
 
-    pub fn decode_quote_string(
+    fn decode_quote_string(
         quote: &str,
     ) -> Result<(AttestBuffer, Signature, PcrSelectionList, PcrData)> {
         if !quote.starts_with('r') {
@@ -2156,7 +2046,7 @@ pub mod testing {
     /// Reference:
     /// https://github.com/tpm2-software/tpm2-tools/blob/master/tools/tpm2_checkquote.c
     pub fn check_quote(
-        context: &mut Context,
+        context: &mut tss_esapi::Context,
         ak_handle: KeyHandle,
         quote: &str,
         nonce: &[u8],
@@ -2225,18 +2115,279 @@ pub mod testing {
 
         Ok(())
     }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_create_ek() {
+        let mut ctx = Context::new().unwrap(); //#[allow_ci]
+        let algs = [EncryptionAlgorithm::Rsa, EncryptionAlgorithm::Ecc];
+        // TODO: create persistent handle and add to be tested: Some("0x81000000"),
+        let handles = [Some(""), None];
+
+        for alg in algs {
+            for handle in handles {
+                let r = ctx.create_ek(alg, handle);
+                assert!(r.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_create_and_load_ak() {
+        let mut ctx = Context::new().unwrap(); //#[allow_ci]
+
+        let r = ctx.create_ek(EncryptionAlgorithm::Rsa, None);
+        assert!(r.is_ok());
+
+        let ek_result = r.unwrap(); //#[allow_ci]
+        let ek_handle = ek_result.key_handle;
+
+        let hash_algs = [
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha384,
+            //HashingAlgorithm::Sha512, // Not supported by swtpm
+            //HashingAlgorithm::Sm3_256, // Not supported by swtpm
+            //HashingAlgorithm::Sha3_384, // Not supported by swtpm
+            //HashingAlgorithm::Sha3_512, // Not supported by swtpm
+            //HashingAlgorithm::Sha1, // Not supported by swtpm
+        ];
+        let sign_algs = [
+            SignAlgorithm::RsaSsa,
+            SignAlgorithm::RsaPss,
+            // - ECC keys creation requires this: https://github.com/parallaxsecond/rust-tss-esapi/pull/464
+            //   Probably this will be released on tss_esapi version 8.0.0, which includes API
+            //   breakage
+            // SignAlgorithm::EcDsa,
+            // SignAlgorithm::EcSchnorr,
+        ];
+
+        for sign in sign_algs {
+            for hash in hash_algs {
+                let r = ctx.create_ak(ek_handle, hash, sign);
+                assert!(r.is_ok());
+
+                let ak = r.unwrap(); //#[allow_ci]
+
+                let r = ctx.load_ak(ek_handle, &ak);
+                assert!(r.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_create_idevid() {
+        let asym_algs = [AsymmetricAlgorithm::Rsa, AsymmetricAlgorithm::Ecc];
+        let hash_algs = [
+            HashingAlgorithm::Sha256,
+            HashingAlgorithm::Sha384,
+            //HashingAlgorithm::Sha512, // Not supported by swtpm
+            //HashingAlgorithm::Sm3_256, // Not supported by swtpm
+            //HashingAlgorithm::Sha3_384, // Not supported by swtpm
+            //HashingAlgorithm::Sha3_512, // Not supported by swtpm
+            //HashingAlgorithm::Sha1, // Not supported by swtpm
+        ];
+
+        let mut ctx = Context::new().unwrap(); //#[allow_ci]
+
+        for asym in asym_algs {
+            for hash in hash_algs {
+                let r = ctx.create_idevid(asym, hash);
+                assert!(r.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_create_iak() {
+        let mut ctx = Context::new().unwrap(); //#[allow_ci]
+
+        let asym_algs = [AsymmetricAlgorithm::Rsa, AsymmetricAlgorithm::Ecc];
+        let hash_algs = [
+            HashingAlgorithm::Sha256,
+            HashingAlgorithm::Sha384,
+            //HashingAlgorithm::Sha512, // Not supported by swtpm
+            //HashingAlgorithm::Sm3_256, // Not supported by swtpm
+            //HashingAlgorithm::Sha3_384, // Not supported by swtpm
+            //HashingAlgorithm::Sha3_512, // Not supported by swtpm
+            //HashingAlgorithm::Sha1, // Not supported by swtpm
+        ];
+
+        for asym in asym_algs {
+            for hash in hash_algs {
+                let r = ctx.create_iak(asym, hash);
+                assert!(r.is_ok())
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_activate_credential() {
+        let mut ctx = Context::new().unwrap(); //#[allow_ci]
+
+        // Create EK
+        let ek_result = ctx
+            .create_ek(EncryptionAlgorithm::Rsa, None)
+            .expect("failed to create EK");
+        let ek_handle = ek_result.key_handle;
+
+        // Create AK
+        let ak = ctx
+            .create_ak(
+                ek_handle,
+                HashAlgorithm::Sha256,
+                SignAlgorithm::RsaSsa,
+            )
+            .expect("failed to create AK");
+
+        // Get AK handle
+        let ak_handle =
+            ctx.load_ak(ek_handle, &ak).expect("failed to load AK");
+
+        // Get AK name
+        let name = ctx
+            .get_name(ak_handle.into())
+            .expect("failed to get AK name");
+
+        // Generate random challenge
+        let mut challenge: [u8; 32] = [0; 32];
+        let r = openssl::rand::rand_priv_bytes(&mut challenge);
+        assert!(r.is_ok());
+
+        let credential = Digest::try_from(challenge.as_ref())
+            .expect("Failed to convert random bytes to Digest structure");
+
+        // Make credential, which encrypts the challenge
+        let keyblob = ctx
+            .make_credential(ek_handle, credential.clone(), name)
+            .expect("failed to create keyblob");
+
+        // Activate credential, which decrypts the challenge
+        let decrypted = ctx
+            .activate_credential(keyblob, ak_handle, ek_handle)
+            .expect("failed to decrypt challenge");
+        assert_eq!(decrypted, credential);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_certify_credential_with_iak() {
+        let mut ctx = Context::new().unwrap(); //#[allow_ci]
+
+        // Create EK
+        let ek_result = ctx
+            .create_ek(EncryptionAlgorithm::Rsa, None)
+            .expect("failed to create EK");
+        let ek_handle = ek_result.key_handle;
+
+        // Create AK
+        let ak = ctx
+            .create_ak(
+                ek_handle,
+                HashAlgorithm::Sha256,
+                SignAlgorithm::RsaSsa,
+            )
+            .expect("failed to create ak");
+
+        let ak_handle =
+            ctx.load_ak(ek_handle, &ak).expect("failed to load AK");
+
+        let iak_handle = ctx
+            .create_iak(AsymmetricAlgorithm::Rsa, HashingAlgorithm::Sha256)
+            .expect("failed to create IAK")
+            .handle;
+
+        let qualifying_data = "some_uuid".as_bytes();
+
+        let r = ctx.certify_credential_with_iak(
+            Data::try_from(qualifying_data).unwrap(), //#[allow_ci]
+            ak_handle,
+            iak_handle,
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn test_check_mask() {
+        // Test simply reading a mask
+        let r = read_mask(0xFFFF);
+        assert!(r.is_ok());
+
+        // Test with mask containing the PCR
+        let should_be_true = check_mask(0xFFFF, &PcrSlot::Slot10)
+            .expect("failed to check mask");
+        assert!(should_be_true);
+
+        // Test a mask not containing the specific PCR
+        let should_be_false = check_mask(0xFFFD, &PcrSlot::Slot1)
+            .expect("failed to check mask");
+        assert!(!should_be_false);
+
+        // Test that trying a mask with bits not in the range from 0 to 23 fails
+        let r = check_mask(1 << 24, &PcrSlot::Slot1);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_get_idevid_template() {
+        let cases = [
+            ("H-1", (AsymmetricAlgorithm::Rsa, HashingAlgorithm::Sha256)),
+            ("H-2", (AsymmetricAlgorithm::Ecc, HashingAlgorithm::Sha256)),
+            ("H-3", (AsymmetricAlgorithm::Ecc, HashingAlgorithm::Sha384)),
+            ("H-4", (AsymmetricAlgorithm::Ecc, HashingAlgorithm::Sha512)),
+            ("H-5", (AsymmetricAlgorithm::Ecc, HashingAlgorithm::Sm3_256)),
+        ];
+
+        for (input, output) in cases {
+            let algs = get_idevid_template("manual", input, "", "")
+                .expect("failed to get IDevID template");
+            assert_eq!(algs, output);
+        }
+
+        let auto = ["", "detect", "default"];
+
+        for keyword in auto {
+            let algs = get_idevid_template("H-1", keyword, "", "")
+                .expect("failed to get IDevID template");
+            assert_eq!(
+                algs,
+                (AsymmetricAlgorithm::Rsa, HashingAlgorithm::Sha256)
+            );
+        }
+    }
+
+    #[test]
+    fn test_quote_encode_decode() {
+        let quote_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data")
+            .join("test-quote.txt");
+
+        let f =
+            File::open(quote_path).expect("unable to open test-quote.txt");
+        let mut f = BufReader::new(f);
+        let mut buf = String::new();
+        let _ = f.read_line(&mut buf).expect("unable to read quote");
+        let buf = buf.trim_end();
+
+        let (att, sig, pcrsel, pcrdata) =
+            decode_quote_string(buf).expect("unable to decode quote");
+
+        let attestation: Attest =
+            att.try_into().expect("unable to unmarshal attestation");
+
+        let encoded = encode_quote_string(attestation, sig, pcrsel, pcrdata)
+            .expect("unable to encode quote");
+
+        assert_eq!(encoded, buf);
+    }
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
-
-    #[cfg(feature = "testing")]
-    use std::{
-        fs::File,
-        io::{BufRead, BufReader},
-        path::Path,
-    };
 
     #[test]
     fn test_pubkey_to_digest() {
@@ -2303,321 +2454,5 @@ pub mod tests {
         );
 
         assert!(read_mask(0x1ffffff).is_err());
-    }
-
-    #[test]
-    fn test_check_mask() {
-        // Test simply reading a mask
-        let r = read_mask(0xFFFF);
-        assert!(r.is_ok(), "Result: {r:?}");
-
-        // Test with mask containing the PCR
-        let should_be_true = check_mask(0xFFFF, &PcrSlot::Slot10)
-            .expect("failed to check mask");
-        assert!(should_be_true);
-
-        // Test a mask not containing the specific PCR
-        let should_be_false = check_mask(0xFFFD, &PcrSlot::Slot1)
-            .expect("failed to check mask");
-        assert!(!should_be_false);
-
-        // Test that trying a mask with bits not in the range from 0 to 23 fails
-        let r = check_mask(1 << 24, &PcrSlot::Slot1);
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn test_get_idevid_template() {
-        let cases = [
-            ("H-1", (AsymmetricAlgorithm::Rsa, HashingAlgorithm::Sha256)),
-            ("H-2", (AsymmetricAlgorithm::Ecc, HashingAlgorithm::Sha256)),
-            ("H-3", (AsymmetricAlgorithm::Ecc, HashingAlgorithm::Sha384)),
-            ("H-4", (AsymmetricAlgorithm::Ecc, HashingAlgorithm::Sha512)),
-            ("H-5", (AsymmetricAlgorithm::Ecc, HashingAlgorithm::Sm3_256)),
-        ];
-
-        for (input, output) in cases {
-            let algs = get_idevid_template("manual", input, "", "")
-                .expect("failed to get IDevID template");
-            assert_eq!(algs, output);
-        }
-
-        let auto = ["", "detect", "default"];
-
-        for keyword in auto {
-            let algs = get_idevid_template("H-1", keyword, "", "")
-                .expect("failed to get IDevID template");
-            assert_eq!(
-                algs,
-                (AsymmetricAlgorithm::Rsa, HashingAlgorithm::Sha256)
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "testing")]
-    fn test_quote_encode_decode() {
-        let quote_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-data")
-            .join("test-quote.txt");
-
-        let f =
-            File::open(quote_path).expect("unable to open test-quote.txt");
-        let mut f = BufReader::new(f);
-        let mut buf = String::new();
-        let _ = f.read_line(&mut buf).expect("unable to read quote");
-        let buf = buf.trim_end();
-
-        let (att, sig, pcrsel, pcrdata) = testing::decode_quote_string(buf)
-            .expect("unable to decode quote");
-
-        let attestation: Attest =
-            att.try_into().expect("unable to unmarshal attestation");
-
-        let encoded = encode_quote_string(attestation, sig, pcrsel, pcrdata)
-            .expect("unable to encode quote");
-
-        assert_eq!(encoded, buf);
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "testing")]
-    async fn test_create_ek() {
-        let _mutex = testing::lock_tests().await;
-        let mut ctx = Context::new().unwrap(); //#[allow_ci]
-        let algs = [EncryptionAlgorithm::Rsa, EncryptionAlgorithm::Ecc];
-        // TODO: create persistent handle and add to be tested: Some("0x81000000"),
-        let handles = [Some(""), None];
-
-        for alg in algs {
-            for handle in handles {
-                let r = ctx.create_ek(alg, handle);
-                assert!(r.is_ok());
-                let ek = r.unwrap(); //#[allow_ci]
-
-                // Flush context to free TPM memory
-                let r = ctx.flush_context(ek.key_handle.into());
-                assert!(r.is_ok(), "Result: {r:?}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "testing")]
-    async fn test_create_and_load_ak() {
-        let _mutex = testing::lock_tests().await;
-        let mut ctx = Context::new().unwrap(); //#[allow_ci]
-
-        let r = ctx.create_ek(EncryptionAlgorithm::Rsa, None);
-        assert!(r.is_ok(), "Result: {r:?}");
-
-        let ek_result = r.unwrap(); //#[allow_ci]
-        let ek_handle = ek_result.key_handle;
-
-        let hash_algs = [
-            HashAlgorithm::Sha256,
-            HashAlgorithm::Sha384,
-            //HashingAlgorithm::Sha512, // Not supported by swtpm
-            //HashingAlgorithm::Sm3_256, // Not supported by swtpm
-            //HashingAlgorithm::Sha3_384, // Not supported by swtpm
-            //HashingAlgorithm::Sha3_512, // Not supported by swtpm
-            //HashingAlgorithm::Sha1, // Not supported by swtpm
-        ];
-        let sign_algs = [
-            SignAlgorithm::RsaSsa,
-            SignAlgorithm::RsaPss,
-            // - ECC keys creation requires this: https://github.com/parallaxsecond/rust-tss-esapi/pull/464
-            //   Probably this will be released on tss_esapi version 8.0.0, which includes API
-            //   breakage
-            // SignAlgorithm::EcDsa,
-            // SignAlgorithm::EcSchnorr,
-        ];
-
-        for sign in sign_algs {
-            for hash in hash_algs {
-                let r = ctx.create_ak(ek_handle, hash, sign);
-                assert!(r.is_ok(), "Result: {r:?}");
-                let ak = r.unwrap(); //#[allow_ci]
-
-                let r = ctx.load_ak(ek_handle, &ak);
-                assert!(r.is_ok(), "Result: {r:?}");
-                let handle = r.unwrap(); //#[allow_ci]
-
-                // Flush context to free TPM memory
-                let r = ctx.flush_context(handle.into());
-                assert!(r.is_ok(), "Result: {r:?}");
-            }
-        }
-
-        // Flush context to free TPM memory
-        let r = ctx.flush_context(ek_handle.into());
-        assert!(r.is_ok(), "Result: {r:?}");
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "testing")]
-    async fn test_create_idevid() {
-        let _mutex = testing::lock_tests().await;
-        let asym_algs = [AsymmetricAlgorithm::Rsa, AsymmetricAlgorithm::Ecc];
-        let hash_algs = [
-            HashingAlgorithm::Sha256,
-            HashingAlgorithm::Sha384,
-            //HashingAlgorithm::Sha512, // Not supported by swtpm
-            //HashingAlgorithm::Sm3_256, // Not supported by swtpm
-            //HashingAlgorithm::Sha3_384, // Not supported by swtpm
-            //HashingAlgorithm::Sha3_512, // Not supported by swtpm
-            //HashingAlgorithm::Sha1, // Not supported by swtpm
-        ];
-
-        let mut ctx = Context::new().unwrap(); //#[allow_ci]
-
-        for asym in asym_algs {
-            for hash in hash_algs {
-                println!("Creating IDevID with {asym:?} and {hash:?}");
-                let r = ctx.create_idevid(asym, hash);
-                assert!(r.is_ok(), "Result: {r:?}");
-                println!(
-                    "Successfully created IDevID with {asym:?} and {hash:?}"
-                );
-                let idevid = r.unwrap(); //#[allow_ci]
-                let r = ctx.flush_context(idevid.handle.into());
-                assert!(r.is_ok(), "Result: {r:?}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "testing")]
-    async fn test_create_iak() {
-        let _mutex = testing::lock_tests().await;
-        let mut ctx = Context::new().unwrap(); //#[allow_ci]
-
-        let asym_algs = [AsymmetricAlgorithm::Rsa, AsymmetricAlgorithm::Ecc];
-        let hash_algs = [
-            HashingAlgorithm::Sha256,
-            HashingAlgorithm::Sha384,
-            //HashingAlgorithm::Sha512, // Not supported by swtpm
-            //HashingAlgorithm::Sm3_256, // Not supported by swtpm
-            //HashingAlgorithm::Sha3_384, // Not supported by swtpm
-            //HashingAlgorithm::Sha3_512, // Not supported by swtpm
-            //HashingAlgorithm::Sha1, // Not supported by swtpm
-        ];
-
-        for asym in asym_algs {
-            for hash in hash_algs {
-                println!("Creating IAK with {asym:?} and {hash:?}");
-                let r = ctx.create_iak(asym, hash);
-                assert!(r.is_ok(), "Result: {r:?}");
-                println!(
-                    "Successfully created IAK with {asym:?} and {hash:?}"
-                );
-                let iak = r.unwrap(); //#[allow_ci]
-                let r = ctx.flush_context(iak.handle.into());
-                assert!(r.is_ok(), "Result: {r:?}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "testing")]
-    async fn test_activate_credential() {
-        let _mutex = testing::lock_tests().await;
-        let mut ctx = Context::new().unwrap(); //#[allow_ci]
-
-        // Create EK
-        let ek_result = ctx
-            .create_ek(EncryptionAlgorithm::Rsa, None)
-            .expect("failed to create EK");
-        let ek_handle = ek_result.key_handle;
-
-        // Create AK
-        let ak = ctx
-            .create_ak(
-                ek_handle,
-                HashAlgorithm::Sha256,
-                SignAlgorithm::RsaSsa,
-            )
-            .expect("failed to create AK");
-
-        // Get AK handle
-        let ak_handle =
-            ctx.load_ak(ek_handle, &ak).expect("failed to load AK");
-
-        // Get AK name
-        let name = ctx
-            .get_name(ak_handle.into())
-            .expect("failed to get AK name");
-
-        // Generate random challenge
-        let mut challenge: [u8; 32] = [0; 32];
-        let r = openssl::rand::rand_priv_bytes(&mut challenge);
-        assert!(r.is_ok(), "Result: {r:?}");
-
-        let credential = Digest::try_from(challenge.as_ref())
-            .expect("Failed to convert random bytes to Digest structure");
-
-        // Make credential, which encrypts the challenge
-        let keyblob = ctx
-            .make_credential(ek_handle, credential.clone(), name)
-            .expect("failed to create keyblob");
-
-        // Activate credential, which decrypts the challenge
-        let decrypted = ctx
-            .activate_credential(keyblob, ak_handle, ek_handle)
-            .expect("failed to decrypt challenge");
-        assert_eq!(decrypted, credential);
-
-        // Flush context to free TPM memory
-        let r = ctx.flush_context(ek_handle.into());
-        assert!(r.is_ok(), "Result: {r:?}");
-        let r = ctx.flush_context(ak_handle.into());
-        assert!(r.is_ok(), "Result: {r:?}");
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "testing")]
-    async fn test_certify_credential_with_iak() {
-        let _mutex = testing::lock_tests().await;
-        let mut ctx = Context::new().unwrap(); //#[allow_ci]
-
-        // Create EK
-        let ek_result = ctx
-            .create_ek(EncryptionAlgorithm::Rsa, None)
-            .expect("failed to create EK");
-        let ek_handle = ek_result.key_handle;
-
-        // Create AK
-        let ak = ctx
-            .create_ak(
-                ek_handle,
-                HashAlgorithm::Sha256,
-                SignAlgorithm::RsaSsa,
-            )
-            .expect("failed to create ak");
-
-        let ak_handle =
-            ctx.load_ak(ek_handle, &ak).expect("failed to load AK");
-
-        let iak_handle = ctx
-            .create_iak(AsymmetricAlgorithm::Rsa, HashingAlgorithm::Sha256)
-            .expect("failed to create IAK")
-            .handle;
-
-        let qualifying_data = "some_uuid".as_bytes();
-
-        let r = ctx.certify_credential_with_iak(
-            Data::try_from(qualifying_data).unwrap(), //#[allow_ci]
-            ak_handle,
-            iak_handle,
-        );
-        assert!(r.is_ok(), "Result: {r:?}");
-
-        // Flush context to free TPM memory
-        let r = ctx.flush_context(ek_handle.into());
-        assert!(r.is_ok(), "Result: {r:?}");
-        let r = ctx.flush_context(ak_handle.into());
-        assert!(r.is_ok(), "Result: {r:?}");
-        let r = ctx.flush_context(iak_handle.into());
-        assert!(r.is_ok(), "Result: {r:?}");
     }
 }

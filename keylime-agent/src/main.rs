@@ -32,7 +32,6 @@
 #![allow(unused, missing_docs)]
 
 mod agent_handler;
-mod api;
 mod common;
 mod config;
 mod error;
@@ -75,6 +74,8 @@ use std::{
     str::FromStr,
     sync::Mutex,
     time::Duration,
+    os::raw::c_uchar,
+    ptr,
 };
 use tokio::{
     signal::unix::{signal, SignalKind},
@@ -90,6 +91,22 @@ use tss_esapi::{
 };
 use uuid::Uuid;
 
+use libc::size_t;
+
+#[link(name = "gen_keypair")]
+extern "C" {
+    fn generate_sphincs_keypair() -> KeypairResult;
+}
+
+#[repr(C)]
+struct KeypairResult {
+    public_key: *const u8,
+    public_key_len: size_t,
+    private_key: *const u8,
+    private_key_len: size_t,
+}
+
+
 #[macro_use]
 extern crate static_assertions;
 
@@ -98,8 +115,8 @@ static NOTFOUND: &[u8] = b"Not Found";
 // This data is passed in to the actix httpserver threads that
 // handle quotes.
 #[derive(Debug)]
-pub struct QuoteData<'a> {
-    tpmcontext: Mutex<tpm::Context<'a>>,
+pub struct QuoteData {
+    tpmcontext: Mutex<tpm::Context>,
     priv_key: PKey<Private>,
     pub_key: PKey<Public>,
     ak_handle: KeyHandle,
@@ -120,6 +137,11 @@ pub struct QuoteData<'a> {
     measuredboot_ml_file: Option<Mutex<fs::File>>,
     ima_ml: Mutex<MeasurementList>,
     secure_mount: PathBuf,
+    pq_pub_key: Vec<u8>,
+    pq_pub_key_len: usize,
+    pq_priv_key: Vec<u8>,
+    pq_priv_key_len: usize,
+
 }
 
 #[actix_web::main]
@@ -230,9 +252,7 @@ async fn main() -> Result<()> {
         let message = "The agent mTLS is disabled and 'payload_script' is not empty. To allow the agent to run, 'enable_insecure_payload' has to be set to 'True'".to_string();
 
         error!("Configuration error: {}", &message);
-        return Err(Error::Configuration(
-            config::KeylimeConfigError::Generic(message),
-        ));
+        return Err(Error::Configuration(message));
     }
 
     let secure_size = config.agent.secure_size.clone();
@@ -249,9 +269,7 @@ async fn main() -> Result<()> {
     } else {
         error!("Cannot drop privileges: not enough permission");
         return Err(Error::Configuration(
-            config::KeylimeConfigError::Generic(
-                "Cannot drop privileges: not enough permission".to_string(),
-            ),
+            "Cannot drop privileges: not enough permission".to_string(),
         ));
     };
 
@@ -262,9 +280,7 @@ async fn main() -> Result<()> {
             let message = "The user running the Keylime agent should be set in keylime-agent.conf, using the parameter `run_as`, with the format `user:group`".to_string();
 
             error!("Configuration error: {}", &message);
-            return Err(Error::Configuration(
-                config::KeylimeConfigError::Generic(message),
-            ));
+            return Err(Error::Configuration(message));
         }
         info!("Running the service as {}...", user_group);
     }
@@ -272,6 +288,14 @@ async fn main() -> Result<()> {
     info!("Starting server with API version {}...", API_VERSION);
 
     let mut ctx = tpm::Context::new()?;
+
+    //  Retrieve the TPM Vendor, this allows us to warn if someone is using a
+    // Software TPM ("SW")
+    if tss_esapi::utils::get_tpm_vendor(ctx.as_mut())?.contains("SW") {
+        warn!("INSECURE: Keylime is currently using a software TPM emulator rather than a real hardware TPM.");
+        warn!("INSECURE: The security of Keylime is NOT linked to a hardware root of trust.");
+        warn!("INSECURE: Only use Keylime in this mode for testing or debugging purposes.");
+    }
 
     cfg_if::cfg_if! {
         if #[cfg(feature = "legacy-python-actions")] {
@@ -282,11 +306,10 @@ async fn main() -> Result<()> {
             let python_shim = Path::new(&actions_dir).join("shim.py");
             if !python_shim.exists() {
                 error!("Could not find python shim at {}", python_shim.display());
-                return Err(Error::Configuration(
-                    config::KeylimeConfigError::Generic(format!(
+                return Err(Error::Configuration(format!(
                     "Could not find python shim at {}",
                     python_shim.display()
-                ))));
+                )));
             }
         }
     }
@@ -305,11 +328,11 @@ async fn main() -> Result<()> {
         } else {
             Auth::try_from(tpm_ownerpassword.as_bytes())?
         };
-        ctx.tr_set_auth(Hierarchy::Endorsement.into(), auth)
+        ctx.as_mut().tr_set_auth(Hierarchy::Endorsement.into(), auth)
             .map_err(|e| {
-                Error::Configuration(config::KeylimeConfigError::Generic(format!(
+                Error::Configuration(format!(
                     "Failed to set TPM context password for Endorsement Hierarchy: {e}"
-                )))
+                ))
             })?;
     };
 
@@ -398,7 +421,7 @@ async fn main() -> Result<()> {
             /// If handle is not set in config, recreate IDevID according to template
             info!("Recreating IDevID.");
             let regen_idev = ctx.create_idevid(asym_alg, name_alg)?;
-            ctx.flush_context(regen_idev.handle.into())?;
+            ctx.as_mut().flush_context(regen_idev.handle.into())?;
             // Flush after creating to make room for AK and EK and IAK
             regen_idev
         } else {
@@ -419,7 +442,7 @@ async fn main() -> Result<()> {
             info!("IDevID matches certificate.");
         } else {
             error!("IDevID template does not match certificate. Check template in configuration.");
-            return Err(Error::Configuration(config::KeylimeConfigError::Generic("IDevID template does not match certificate. Check template in configuration.".to_string())));
+            return Err(Error::Configuration("IDevID template does not match certificate. Check template in configuration.".to_string()));
         }
 
         /// IAK recreation/collection
@@ -447,7 +470,7 @@ async fn main() -> Result<()> {
             info!("IAK matches certificate.");
         } else {
             error!("IAK template does not match certificate. Check template in configuration.");
-            return Err(Error::Configuration(config::KeylimeConfigError::Generic("IAK template does not match certificate. Check template in configuration.".to_string())));
+            return Err(Error::Configuration("IAK template does not match certificate. Check template in configuration.".to_string()));
         }
 
         (Some(iak), Some(idevid))
@@ -601,10 +624,10 @@ async fn main() -> Result<()> {
         path => {
             let key_path = Path::new(&path);
             if key_path.exists() {
-                debug!(
-                    "Loading existing key pair from {}",
-                    key_path.display()
-                );
+                // debug!(
+                //     "Loading existing key pair from {}",
+                //     key_path.display()
+                // );
                 crypto::load_key_pair(
                     key_path,
                     Some(config.agent.server_key_password.as_ref()),
@@ -641,10 +664,10 @@ async fn main() -> Result<()> {
             path => {
                 let cert_path = Path::new(&path);
                 if cert_path.exists() {
-                    debug!(
-                        "Loading existing mTLS certificate from {}",
-                        cert_path.display()
-                    );
+                    // debug!(
+                    //     "Loading existing mTLS certificate from {}",
+                    //     cert_path.display()
+                    // );
                     crypto::load_x509_pem(cert_path)?
                 } else {
                     debug!("Generating new mTLS certificate");
@@ -660,11 +683,12 @@ async fn main() -> Result<()> {
             }
         };
 
+
         let trusted_client_ca = match config.agent.trusted_client_ca.as_ref()
         {
             "" => {
                 error!("Agent mTLS is enabled, but trusted_client_ca option was not provided");
-                return Err(Error::Configuration(config::KeylimeConfigError::Generic("Agent mTLS is enabled, but trusted_client_ca option was not provided".to_string())));
+                return Err(Error::Configuration("Agent mTLS is enabled, but trusted_client_ca option was not provided".to_string()));
             }
             l => l,
         };
@@ -675,9 +699,9 @@ async fn main() -> Result<()> {
             error!(
                 "Trusted client CA certificate list is empty: could not load any certificate"
             );
-            return Err(Error::Configuration(config::KeylimeConfigError::Generic(
+            return Err(Error::Configuration(
                 "Trusted client CA certificate list is empty: could not load any certificate".to_string()
-            )));
+            ));
         }
 
         let keylime_ca_certs = match crypto::load_x509_cert_list(
@@ -702,6 +726,45 @@ async fn main() -> Result<()> {
         warn!("mTLS disabled, Tenant and Verifier will reach out to agent via HTTP");
     }
 
+
+
+    //Creazione delle chiavi sphincs
+    let mut pq_key_base64 = String::new();
+    
+        // Chiamata alla funzione C per generare le chiavi
+        let pq_result = unsafe {
+            generate_sphincs_keypair()
+        };
+       
+                // Trasformare i puntatori in Vec<u8>
+        let public_key_vec = unsafe {
+            if !pq_result.public_key.is_null() {
+                Vec::from(std::slice::from_raw_parts(
+                    pq_result.public_key,
+                    pq_result.public_key_len,
+                ))
+            } else {
+                Vec::new() // Restituisce un vettore vuoto se il puntatore è nullo
+            }
+        };
+
+        let private_key_vec = unsafe {
+            if !pq_result.private_key.is_null() {
+                Vec::from(std::slice::from_raw_parts(
+                    pq_result.private_key,
+                    pq_result.private_key_len,
+                ))
+            } else {
+                Vec::new()
+            }
+        };
+        let pq_key_base64: String = general_purpose::STANDARD.encode(&public_key_vec);
+
+            
+            // Liberazione della memoria allocata dal lato C
+        unsafe {
+            libc::free(pq_result.public_key as *mut _);
+        }
     {
         // Request keyblob material
         let keyblob = if config.agent.enable_iak_idevid {
@@ -711,10 +774,10 @@ async fn main() -> Result<()> {
                 error!(
                     "IDevID and IAK are enabled but could not be generated"
                 );
-                return Err(Error::Configuration(config::KeylimeConfigError::Generic(
+                return Err(Error::Configuration(
                     "IDevID and IAK are enabled but could not be generated"
                         .to_string(),
-                )));
+                ));
             };
             registrar_agent::do_register_agent(
                 config.agent.registrar_ip.as_ref(),
@@ -739,6 +802,7 @@ async fn main() -> Result<()> {
                 mtls_cert,
                 config.agent.contact_ip.as_ref(),
                 config.agent.contact_port,
+                pq_key_base64.clone(),
             )
             .await?
         } else {
@@ -759,6 +823,7 @@ async fn main() -> Result<()> {
                 mtls_cert,
                 config.agent.contact_ip.as_ref(),
                 config.agent.contact_port,
+                pq_key_base64.clone(),
             )
             .await?
         };
@@ -772,7 +837,7 @@ async fn main() -> Result<()> {
         )?;
         // Flush EK if we created it
         if config.agent.ek_handle.is_empty() {
-            ctx.flush_context(ek_result.key_handle.into())?;
+            ctx.as_mut().flush_context(ek_result.key_handle.into())?;
         }
         let mackey = general_purpose::STANDARD.encode(key.value());
         let auth_tag =
@@ -806,10 +871,10 @@ async fn main() -> Result<()> {
             error!(
                 "No revocation certificate set in 'revocation_cert' option"
             );
-            return Err(Error::Configuration(config::KeylimeConfigError::Generic(
+            return Err(Error::Configuration(
                 "No revocation certificate set in 'revocation_cert' option"
                     .to_string(),
-            )));
+            ));
         }
         s => PathBuf::from(s),
     };
@@ -854,81 +919,123 @@ async fn main() -> Result<()> {
         measuredboot_ml_file,
         ima_ml: Mutex::new(MeasurementList::new()),
         secure_mount: PathBuf::from(&mount),
+        pq_pub_key: public_key_vec,
+        pq_pub_key_len: pq_result.public_key_len,
+        pq_priv_key: private_key_vec, 
+        pq_priv_key_len: pq_result.private_key_len,
     });
 
-    let actix_server = HttpServer::new(move || {
-        let mut app = App::new()
-            .wrap(middleware::ErrorHandlers::new().handler(
-                http::StatusCode::NOT_FOUND,
-                errors_handler::wrap_404,
-            ))
-            .wrap(middleware::Logger::new(
-                "%r from %a result %s (took %D ms)",
-            ))
-            .wrap_fn(|req, srv| {
-                info!(
-                    "{} invoked from {:?} with uri {}",
-                    req.head().method,
-                    req.connection_info().peer_addr().unwrap(), //#[allow_ci]
-                    req.uri()
-                );
-                srv.call(req)
-            })
-            .app_data(quotedata.clone())
-            .app_data(
-                web::JsonConfig::default()
-                    .error_handler(errors_handler::json_parser_error),
-            )
-            .app_data(
-                web::QueryConfig::default()
-                    .error_handler(errors_handler::query_parser_error),
-            )
-            .app_data(
-                web::PathConfig::default()
-                    .error_handler(errors_handler::path_parser_error),
-            );
-
-        let enabled_api_versions = api::SUPPORTED_API_VERSIONS;
-
-        for version in enabled_api_versions {
-            // This should never fail, thus unwrap should never panic
-            let scope = api::get_api_scope(version).unwrap(); //#[allow_ci]
-            app = app.service(scope);
-        }
-
-        app.service(
-            web::resource("/version")
-                .route(web::get().to(version_handler::version)),
-        )
-        .service(
-            web::resource(r"/v{major:\d+}.{minor:\d+}{tail}*")
-                .to(errors_handler::version_not_supported),
-        )
-        .default_service(web::to(errors_handler::app_default))
-    })
-    // Disable default signal handlers.  See:
-    // https://github.com/actix/actix-web/issues/2739
-    // for details.
-    .disable_signals();
+    let actix_server =
+        HttpServer::new(move || {
+            App::new()
+                .wrap(middleware::ErrorHandlers::new().handler(
+                    http::StatusCode::NOT_FOUND,
+                    errors_handler::wrap_404,
+                ))
+                .wrap(middleware::Logger::new(
+                    "%r from %a result %s (took %D ms)",
+                ))
+                .wrap_fn(|req, srv| {
+                    info!(
+                        "{} invoked from {:?} with uri {}",
+                        req.head().method,
+                        req.connection_info().peer_addr().unwrap(), //#[allow_ci]
+                        req.uri()
+                    );
+                    srv.call(req)
+                })
+                .app_data(quotedata.clone())
+                .app_data(
+                    web::JsonConfig::default()
+                        .error_handler(errors_handler::json_parser_error),
+                )
+                .app_data(
+                    web::QueryConfig::default()
+                        .error_handler(errors_handler::query_parser_error),
+                )
+                .app_data(
+                    web::PathConfig::default()
+                        .error_handler(errors_handler::path_parser_error),
+                )
+                .service(
+                    web::scope(&format!("/{API_VERSION}"))
+                        .service(
+                            web::scope("/agent")
+                                .service(web::resource("/info").route(
+                                    web::get().to(agent_handler::info),
+                                ))
+                                .default_service(web::to(
+                                    errors_handler::agent_default,
+                                )),
+                        )
+                        .service(
+                            web::scope("/keys")
+                                .service(web::resource("/pubkey").route(
+                                    web::get().to(keys_handler::pubkey),
+                                ))
+                                .service(web::resource("/ukey").route(
+                                    web::post().to(keys_handler::u_key),
+                                ))
+                                .service(web::resource("/verify").route(
+                                    web::get().to(keys_handler::verify),
+                                ))
+                                .service(web::resource("/vkey").route(
+                                    web::post().to(keys_handler::v_key),
+                                ))
+                                .default_service(web::to(
+                                    errors_handler::keys_default,
+                                )),
+                        )
+                        .service(
+                            web::scope("/notifications")
+                                .service(web::resource("/revocation").route(
+                                    web::post().to(
+                                        notifications_handler::revocation,
+                                    ),
+                                ))
+                                .default_service(web::to(
+                                    errors_handler::notifications_default,
+                                )),
+                        )
+                        .service(
+                            web::scope("/quotes")
+                                .service(web::resource("/identity").route(
+                                    web::get().to(quotes_handler::identity),
+                                ))
+                                .service(web::resource("/integrity").route(
+                                    web::get().to(quotes_handler::integrity),
+                                ))
+                                .default_service(web::to(
+                                    errors_handler::quotes_default,
+                                )),
+                        )
+                        .default_service(web::to(
+                            errors_handler::api_default,
+                        )),
+                )
+                .service(
+                    web::resource("/version")
+                        .route(web::get().to(version_handler::version)),
+                )
+                .service(
+                    web::resource(r"/v{major:\d+}.{minor:\d+}{tail}*")
+                        .to(errors_handler::version_not_supported),
+                )
+                .default_service(web::to(errors_handler::app_default))
+        })
+        // Disable default signal handlers.  See:
+        // https://github.com/actix/actix-web/issues/2739
+        // for details.
+        .disable_signals();
 
     let server;
 
-    // Try to parse as an IP address
-    let ip = match config.agent.ip.parse::<IpAddr>() {
-        Ok(ip_addr) => {
-            // Add bracket if IPv6, otherwise use as it is
-            if ip_addr.is_ipv6() {
-                format!("[{}]", ip_addr)
-            } else {
-                ip_addr.to_string()
-            }
-        }
-        Err(_) => {
-            // If the address was not an IP address, treat as a hostname
-            config.agent.ip.to_string()
-        }
+    // Add bracket if IPv6
+    let ip = if config.agent.ip.parse::<IpAddr>()?.is_ipv6() {
+        format!("[{}]", config.agent.ip)
+    } else {
+        config.agent.ip.to_string()
     };
-
     let port = config.agent.port;
     if config.agent.enable_agent_mtls && ssl_context.is_some() {
         server = actix_server
@@ -1054,11 +1161,6 @@ mod testing {
     use crate::{config::KeylimeConfig, crypto::CryptoError};
     use thiserror::Error;
 
-    use std::sync::{Arc, Mutex, OnceLock};
-    use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
-
-    use keylime::tpm::testing::lock_tests;
-
     #[derive(Error, Debug)]
     pub(crate) enum MainTestError {
         /// Algorithm error
@@ -1090,22 +1192,8 @@ mod testing {
         TSSError(#[from] tss_esapi::Error),
     }
 
-    impl<'a> Drop for QuoteData<'a> {
-        /// Flush the created AK when dropping
-        fn drop(&mut self) {
-            self.tpmcontext
-                .lock()
-                .unwrap() //#[allow_ci]
-                .flush_context(self.ak_handle.into());
-        }
-    }
-
-    impl<'a> QuoteData<'a> {
-        pub(crate) async fn fixture() -> std::result::Result<
-            (Self, AsyncMutexGuard<'static, ()>),
-            MainTestError,
-        > {
-            let mutex = lock_tests().await;
+    impl QuoteData {
+        pub(crate) fn fixture() -> std::result::Result<Self, MainTestError> {
             let test_config = KeylimeConfig::default();
             let mut ctx = tpm::Context::new()?;
 
@@ -1113,6 +1201,9 @@ mod testing {
                 keylime::algorithms::EncryptionAlgorithm::try_from(
                     test_config.agent.tpm_encryption_alg.as_str(),
                 )?;
+
+            // Gather EK and AK key values and certs
+            let ek_result = ctx.create_ek(tpm_encryption_alg, None)?;
 
             let tpm_hash_alg = keylime::algorithms::HashAlgorithm::try_from(
                 test_config.agent.tpm_hash_alg.as_str(),
@@ -1123,19 +1214,14 @@ mod testing {
                     test_config.agent.tpm_signing_alg.as_str(),
                 )?;
 
-            // Gather EK and AK key values and certs
-            let ek_result = ctx.create_ek(tpm_encryption_alg, None).unwrap(); //#[allow_ci]
-            let ak_result = ctx
-                .create_ak(
-                    ek_result.key_handle,
-                    tpm_hash_alg,
-                    tpm_signing_alg,
-                )
-                .unwrap(); //#[allow_ci]
-            let ak_handle =
-                ctx.load_ak(ek_result.key_handle, &ak_result).unwrap(); //#[allow_ci]
-
-            ctx.flush_context(ek_result.key_handle.into()).unwrap(); //#[allow_ci]
+            let ak_result = ctx.create_ak(
+                ek_result.key_handle,
+                tpm_hash_alg,
+                tpm_signing_alg,
+            )?;
+            let ak_handle = ctx.load_ak(ek_result.key_handle, &ak_result)?;
+            let ak_tpm2b_pub =
+                PublicBuffer::try_from(ak_result.public)?.marshall()?;
 
             let rsa_key_path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("test-data")
@@ -1190,31 +1276,28 @@ mod testing {
                     Err(err) => None,
                 };
 
-            Ok((
-                QuoteData {
-                    tpmcontext: Mutex::new(ctx),
-                    priv_key: nk_priv,
-                    pub_key: nk_pub,
-                    ak_handle,
-                    keys_tx,
-                    payload_tx,
-                    revocation_tx,
-                    hash_alg: keylime::algorithms::HashAlgorithm::Sha256,
-                    enc_alg: keylime::algorithms::EncryptionAlgorithm::Rsa,
-                    sign_alg: keylime::algorithms::SignAlgorithm::RsaSsa,
-                    agent_uuid: test_config.agent.uuid,
-                    allow_payload_revocation_actions: test_config
-                        .agent
-                        .allow_payload_revocation_actions,
-                    secure_size: test_config.agent.secure_size,
-                    work_dir,
-                    ima_ml_file,
-                    measuredboot_ml_file,
-                    ima_ml: Mutex::new(MeasurementList::new()),
-                    secure_mount,
-                },
-                mutex,
-            ))
+            Ok(QuoteData {
+                tpmcontext: Mutex::new(ctx),
+                priv_key: nk_priv,
+                pub_key: nk_pub,
+                ak_handle,
+                keys_tx,
+                payload_tx,
+                revocation_tx,
+                hash_alg: keylime::algorithms::HashAlgorithm::Sha256,
+                enc_alg: keylime::algorithms::EncryptionAlgorithm::Rsa,
+                sign_alg: keylime::algorithms::SignAlgorithm::RsaSsa,
+                agent_uuid: test_config.agent.uuid,
+                allow_payload_revocation_actions: test_config
+                    .agent
+                    .allow_payload_revocation_actions,
+                secure_size: test_config.agent.secure_size,
+                work_dir,
+                ima_ml_file,
+                measuredboot_ml_file,
+                ima_ml: Mutex::new(MeasurementList::new()),
+                secure_mount,
+            })
         }
     }
 }

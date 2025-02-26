@@ -224,6 +224,18 @@ pub async fn identity(
 // by the mask. It should return this data:
 // { QuoteAIK(nonce, 16:H(NK_pub), xi:yi), NK_pub}
 // where xi:yi are additional PCRs to be included in the quote.
+fn filter_measurements_by_path(
+    measurements: &str,
+    paths: &[&str],
+) -> String {
+    info!("Filtering measurements for paths: {:?}", paths);
+    let filtered: Vec<&str> = measurements
+        .lines()
+        .filter(|line| paths.iter().any(|path|line.contains(path)))
+        .collect();
+    info!("Number of measurements after filtering: {}", filtered.len());
+    filtered.join("\n")
+}
 pub async fn integrity(
     req: HttpRequest,
     param: web::Query<Integ>,
@@ -394,7 +406,11 @@ pub async fn integrity(
                 nth_entry,
             ) {
                 Ok(result) => {
-                    (Some(result.0), Some(result.1), Some(result.2))
+                    let filtered_ima_measurement_list = filter_measurements_by_path(
+                        &result.0,
+                        &["/home/lab7nuc/golden_values_dir", "boot_aggregate", "/init"]);
+                    info!("Filtered IMA measurements: {}", filtered_ima_measurement_list);
+                    (Some(filtered_ima_measurement_list), Some(result.1), Some(result.2))
                 }
                 Err(e) => {
                     debug!("Unable to read measurement list: {:?}", e);
@@ -452,10 +468,15 @@ pub async fn integrity(
         enc_alg: quote.enc_alg,
         sign_alg: quote.sign_alg,
         pubkey: quote.pubkey,
-        ima_measurement_list: quote.ima_measurement_list,
-        mb_measurement_list: quote.mb_measurement_list,
+        ima_measurement_list: quote.ima_measurement_list.clone(),
+        mb_measurement_list: quote.mb_measurement_list.clone(),
         ima_measurement_list_entry: quote.ima_measurement_list_entry,
     };
+
+    // Log the entire quote content
+    info!("Content of ima measurement list: {:?}", pq_quote.ima_measurement_list);
+    // info!("Content of ima measurement list entry: {:?}", pq_quote.ima_measurement_list_entry);
+    // info!("Content of measured boot measurement list: {:?}", pq_quote.mb_measurement_list);
 
 
     // Printing each field

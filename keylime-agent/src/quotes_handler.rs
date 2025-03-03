@@ -406,11 +406,7 @@ pub async fn integrity(
                 nth_entry,
             ) {
                 Ok(result) => {
-                    let filtered_ima_measurement_list = filter_measurements_by_path(
-                        &result.0,
-                        &["/home/lab7nuc/golden_values_dir", "boot_aggregate", "/init"]);
-                    info!("Filtered IMA measurements: {}", filtered_ima_measurement_list);
-                    (Some(filtered_ima_measurement_list), Some(result.1), Some(result.2))
+                    (Some(result.0), Some(result.1), Some(result.2))
                 }
                 Err(e) => {
                     debug!("Unable to read measurement list: {:?}", e);
@@ -474,7 +470,7 @@ pub async fn integrity(
     };
 
     // Log the entire quote content
-    info!("Content of ima measurement list: {:?}", pq_quote.ima_measurement_list);
+    //info!("Content of ima measurement list: {:?}", pq_quote.ima_measurement_list);
     // info!("Content of ima measurement list entry: {:?}", pq_quote.ima_measurement_list_entry);
     // info!("Content of measured boot measurement list: {:?}", pq_quote.mb_measurement_list);
 

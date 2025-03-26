@@ -175,14 +175,14 @@ pub async fn identity(
 
       let pq_priv_key_cstring: *const u8 = data.pq_priv_key.as_ptr();
 
-      // Chiamata alla funzione C
+      // PQ signature
       let result = unsafe {
       sign_with_sphincs(quote_ptr, quote.quote.len(),pq_priv_key_cstring,data.pq_priv_key_len) 
 
       };
   
       if !result.signature.is_null() {
-          // Conversione dei puntatori in slice Rust
+          // Conversion from C pointer to Rust slice
           let signature_slice = unsafe { std::slice::from_raw_parts(result.signature, result.signature_len as usize) };
           let signature_vec = signature_slice.to_vec();
   

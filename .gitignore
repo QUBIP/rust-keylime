@@ -6,3 +6,6 @@ tests/.tmp*
 tests/actions/__pycache__
 tests/unzipped/__pycache__
 *.so
+*.crt
+*.json
+*.pub

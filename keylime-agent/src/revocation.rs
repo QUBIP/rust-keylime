@@ -449,7 +449,7 @@ pub(crate) async fn worker(
     work_dir: impl AsRef<Path>,
     mount: impl AsRef<Path>,
 ) -> Result<()> {
-    debug!("Starting revocation worker");
+    // debug!("Starting revocation worker");
 
     let mut revocation_cert: Option<openssl::x509::X509> = None;
 

@@ -138,7 +138,7 @@ pub(crate) fn run_as(user_group: &str) -> Result<()> {
         return Err(Error::Permission);
     }
 
-    info!("Dropped privileges to run as {}", user_group);
+    //info!("Dropped privileges to run as {}", user_group);
 
     Ok(())
 }
@@ -165,6 +165,6 @@ pub(crate) fn chown(user_group: &str, path: &Path) -> Result<()> {
         return Err(Error::Permission);
     }
 
-    info!("Changed file {} owner to {}.", path.display(), user_group);
+    //info!("Changed file {} owner to {}.", path.display(), user_group);
     Ok(())
 }

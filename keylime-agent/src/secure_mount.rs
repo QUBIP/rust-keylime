@@ -43,7 +43,7 @@ fn check_mount(secure_dir: &Path) -> Result<bool> {
                     // The file system type is the first element after the separator
                     if let Some(fs_type) = iter.next() {
                         if fs_type == "tmpfs" {
-                            debug!("Secure store location {} already mounted on tmpfs", secure_dir.display());
+                            //debug!("Secure store location {} already mounted on tmpfs", secure_dir.display());
                             return Ok(true);
                         } else {
                             let message = format!("Secure storage location {} already mounted on wrong file system type: {}. Unmount to continue.", secure_dir.display(), fs_type);

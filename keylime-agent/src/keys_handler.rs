@@ -488,7 +488,7 @@ pub(crate) async fn worker(
     let mut vkeys: Vec<VKey> = Vec::new();
     let mut symm_key: Option<SymmKey> = None;
 
-    debug!("Starting keys worker");
+    // debug!("Starting keys worker");
 
     // Receive message
     while let Some((message, resp_tx)) = keys_rx.recv().await {

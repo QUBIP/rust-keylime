@@ -276,7 +276,7 @@ pub(crate) async fn worker(
     mut revocation_tx: Sender<RevocationMessage>,
     #[cfg(feature = "with-zmq")] mut zmq_tx: Sender<ZmqMessage>,
 ) -> Result<()> {
-    debug!("Starting payloads worker");
+    //debug!("Starting payloads worker");
 
     // Receive message
     while let Some(message) = payload_rx.recv().await {

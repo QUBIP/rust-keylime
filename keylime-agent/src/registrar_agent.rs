@@ -9,22 +9,6 @@ use serde_json::Number;
 use std::net::IpAddr;
 use base64::Engine;
 
-// use std::os::raw::c_uchar;
-// use libc::size_t as c_size_t;
-// use std::ptr;
-
-// #[link(name = "genpqkey")]
-// extern "C" {
-//     fn generate_sphincs_keypair() -> KeypairResult;
-// }
-
-
-// #[repr(C)]
-// struct KeypairResult {
-//     public_key: *mut c_uchar,
-//     public_key_len: c_size_t,
-// }
-
 fn is_empty(buf: &[u8]) -> bool {
     buf.is_empty()
 }
@@ -127,8 +111,8 @@ pub(crate) async fn do_activate_agent(
     );
 
     info!(
-        "Requesting agent activation from {} for {}",
-        addr, agent_uuid
+        "Requesting agent activation for {}",
+        agent_uuid
     );
 
     let resp = reqwest::Client::new().put(&addr).json(&data).send().await?;
@@ -201,10 +185,10 @@ pub(crate) async fn do_register_agent(
         pq_key: pq_key.clone(),
     };
 
-    info!("Send PQ public key to the registrar \n");
-    // println!("Begin PQ Public KEY (Base64 encoded)-----");
-    // println!("{}", pq_key.clone());
-    // println!("-----End PQ Public KEY");
+    debug!("Send SPHINCS+-SHAKE256 public key to the registrar");
+    debug!("Begin PQ Public KEY (Base64 encoded)-----");
+    debug!("{}", pq_key.clone());
+    debug!("-----End PQ Public KEY");
 
     let remote_ip = match registrar_ip.parse::<IpAddr>() {
         Ok(addr) => {
@@ -231,8 +215,8 @@ pub(crate) async fn do_register_agent(
     );
 
     info!(
-        "Requesting agent registration from {} for {}",
-        addr, agent_uuid
+        "Requesting agent registration for {}",
+        agent_uuid
     );
 
     let resp = reqwest::Client::new()

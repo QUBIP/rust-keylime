@@ -93,9 +93,21 @@ use uuid::Uuid;
 
 use libc::size_t;
 
+// Generate PQ keypair
 #[link(name = "gen_keypair")]
 extern "C" {
     fn generate_sphincs_keypair() -> KeypairResult;
+}
+
+// Here used to sign the challenge during activate credentials
+#[link(name = "sign_with_sphincs")]
+extern "C" {
+    fn sign_with_sphincs(
+        quote: *const u8,
+        quote_len: usize,
+        pq_priv_key: *const u8,
+        pq_priv_key_len: usize,
+    ) -> SignatureResult;
 }
 
 #[repr(C)]
@@ -519,10 +531,10 @@ async fn main() -> Result<()> {
                                     .load_ak(ek_result.key_handle, &ak_result)
                                 {
                                     Ok(ak_handle) => {
-                                        info!(
-                                            "Loaded old AK key from {}",
-                                            path.display()
-                                        );
+                                        // info!(
+                                        //     "Loaded old AK key from {}",
+                                        //     path.display()
+                                        // );
                                         Some((ak_handle, ak_result))
                                     }
                                     Err(e) => {
@@ -583,7 +595,8 @@ async fn main() -> Result<()> {
         path => agent_data_new.store(Path::new(&path))?,
     }
 
-    info!("Agent UUID: {}", agent_uuid);
+    debug!("Hash of Endorsement Key used as UUID");
+    debug!("Agent UUID: {}", agent_uuid);
 
     let (attest, signature) = if config.agent.enable_iak_idevid {
         let qualifying_data = config.agent.uuid.as_bytes();
@@ -829,7 +842,7 @@ async fn main() -> Result<()> {
         };
 
         info!("SUCCESS: Agent {} registered", &agent_uuid);
-
+        info!("Starting Activate Credentials protocol");
         let key = ctx.activate_credential(
             keyblob,
             ak_handle,
@@ -853,6 +866,8 @@ async fn main() -> Result<()> {
         .await?;
         info!("SUCCESS: Agent {} activated", &agent_uuid);
     }
+
+    /* AGENT REGISTRATION DONE */
 
     let (mut payload_tx, mut payload_rx) =
         mpsc::channel::<payloads::PayloadMessage>(1);

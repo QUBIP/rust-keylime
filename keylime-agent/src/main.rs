@@ -76,6 +76,8 @@ use std::{
     time::Duration,
     os::raw::c_uchar,
     ptr,
+    os::raw::c_char, 
+    os::raw::c_ulong
 };
 use tokio::{
     signal::unix::{signal, SignalKind},
@@ -92,6 +94,10 @@ use tss_esapi::{
 use uuid::Uuid;
 
 use libc::size_t;
+
+use std::ffi::CString;
+use quantcrypt::dsas::DsaAlgorithm;
+use quantcrypt::dsas::DsaKeyGenerator;
 
 // Generate PQ keypair
 #[link(name = "gen_keypair")]
@@ -118,6 +124,11 @@ struct KeypairResult {
     private_key_len: size_t,
 }
 
+#[repr(C)]
+struct SignatureResult {
+    signature: *mut c_uchar,
+    signature_len: c_ulong,
+}
 
 #[macro_use]
 extern crate static_assertions;
@@ -744,40 +755,53 @@ async fn main() -> Result<()> {
     //Creazione delle chiavi sphincs
     let mut pq_key_base64 = String::new();
     
-        // Chiamata alla funzione C per generare le chiavi
-        let pq_result = unsafe {
-            generate_sphincs_keypair()
-        };
-       
-                // Trasformare i puntatori in Vec<u8>
-        let public_key_vec = unsafe {
-            if !pq_result.public_key.is_null() {
-                Vec::from(std::slice::from_raw_parts(
-                    pq_result.public_key,
-                    pq_result.public_key_len,
-                ))
-            } else {
-                Vec::new() // Restituisce un vettore vuoto se il puntatore è nullo
-            }
-        };
-
-        let private_key_vec = unsafe {
-            if !pq_result.private_key.is_null() {
-                Vec::from(std::slice::from_raw_parts(
-                    pq_result.private_key,
-                    pq_result.private_key_len,
-                ))
-            } else {
-                Vec::new()
-            }
-        };
-        let pq_key_base64: String = general_purpose::STANDARD.encode(&public_key_vec);
-
-            
-            // Liberazione della memoria allocata dal lato C
-        unsafe {
-            libc::free(pq_result.public_key as *mut _);
+    // Chiamata alla funzione C per generare le chiavi
+    let pq_result = unsafe {
+        generate_sphincs_keypair()
+    };
+    
+            // Trasformare i puntatori in Vec<u8>
+    let public_key_vec = unsafe {
+        if !pq_result.public_key.is_null() {
+            Vec::from(std::slice::from_raw_parts(
+                pq_result.public_key,
+                pq_result.public_key_len,
+            ))
+        } else {
+            Vec::new() // Restituisce un vettore vuoto se il puntatore è nullo
         }
+    };
+
+    let private_key_vec = unsafe {
+        if !pq_result.private_key.is_null() {
+            Vec::from(std::slice::from_raw_parts(
+                pq_result.private_key,
+                pq_result.private_key_len,
+            ))
+        } else {
+            Vec::new()
+        }
+    };
+    let pq_key_base64: String = general_purpose::STANDARD.encode(&public_key_vec);
+    
+    // Liberazione della memoria allocata dal lato C
+    unsafe {
+        libc::free(pq_result.public_key as *mut _);
+    }
+    
+    // PQ key generation with quantcrypt crate
+    let mut key_generator = DsaKeyGenerator::new(DsaAlgorithm::MlDsa65);
+    let (pq_pub_key, pq_priv_key) = key_generator.generate().unwrap();
+    let pq_pk_b64: String = general_purpose::STANDARD.encode((&pq_pub_key).get_key());
+    fn print_type_of<T>(_: &T) {
+        println!("{}", std::any::type_name::<T>());
+    }
+    debug!("PQ Public KEY");
+    debug!("-----Begin Public KEY-----");
+    debug!("{}", pq_pk_b64.clone());
+    debug!("-----End Public KEY-----");
+
+
     {
         // Request keyblob material
         let keyblob = if config.agent.enable_iak_idevid {
@@ -815,7 +839,7 @@ async fn main() -> Result<()> {
                 mtls_cert,
                 config.agent.contact_ip.as_ref(),
                 config.agent.contact_port,
-                pq_key_base64.clone(),
+                pq_pk_b64.clone(),
             )
             .await?
         } else {
@@ -836,7 +860,7 @@ async fn main() -> Result<()> {
                 mtls_cert,
                 config.agent.contact_ip.as_ref(),
                 config.agent.contact_port,
-                pq_key_base64.clone(),
+                pq_pk_b64.clone(),
             )
             .await?
         };
@@ -853,18 +877,28 @@ async fn main() -> Result<()> {
             ctx.as_mut().flush_context(ek_result.key_handle.into())?;
         }
         let mackey = general_purpose::STANDARD.encode(key.value());
+
+        // auth_tag is the HMAC of the agent UUID using U-Key
         let auth_tag =
             crypto::compute_hmac(mackey.as_bytes(), agent_uuid.as_bytes())?;
         let auth_tag = hex::encode(&auth_tag);
-
+        info!("AUTH TAG: {}", auth_tag);
+        let challenge_sig = pq_priv_key.sign(&auth_tag.as_bytes()).unwrap();
+        // print_type_of(&challenge_sig);
+        info!("Computed PQ signature over auth tag");
+        // info!("PQ SIGNATURE OVER AUTH TAG: {:?}", challenge_sig);
         registrar_agent::do_activate_agent(
             config.agent.registrar_ip.as_ref(),
             config.agent.registrar_port,
             &agent_uuid,
             &auth_tag,
+            challenge_sig
+            
         )
         .await?;
         info!("SUCCESS: Agent {} activated", &agent_uuid);
+
+
     }
 
     /* AGENT REGISTRATION DONE */

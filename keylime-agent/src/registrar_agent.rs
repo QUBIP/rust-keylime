@@ -83,6 +83,7 @@ pub(crate) async fn do_activate_agent(
     registrar_port: u32,
     agent_uuid: &str,
     auth_tag: &str,
+    challenge_sig: Vec<u8>,
 ) -> crate::error::Result<()> {
     let data = Activate { auth_tag };
 
@@ -185,10 +186,7 @@ pub(crate) async fn do_register_agent(
         pq_key: pq_key.clone(),
     };
 
-    debug!("Send SPHINCS+-SHAKE256 public key to the registrar");
-    debug!("Begin PQ Public KEY (Base64 encoded)-----");
-    debug!("{}", pq_key.clone());
-    debug!("-----End PQ Public KEY");
+    debug!("Send PQ public key to the registrar");
 
     let remote_ip = match registrar_ip.parse::<IpAddr>() {
         Ok(addr) => {

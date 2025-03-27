@@ -38,6 +38,7 @@ zmq = {version = "0.9.2", optional = true}
 # dev-dependencies are not supported
 # see: https://github.com/rust-lang/cargo/issues/1596
 wiremock = {version = "0.5", optional = true}
+QuantCrypt = "0.2.0"
 
 [dev-dependencies]
 actix-rt.workspace = true

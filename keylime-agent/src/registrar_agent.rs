@@ -54,7 +54,7 @@ struct Register<'a> {
     ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     port: Option<u32>,
-    pq_key: String,
+    pq_key: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,6 +66,7 @@ struct RegisterResponseResults {
 #[derive(Debug, Serialize, Deserialize)]
 struct Activate<'a> {
     auth_tag: &'a str,
+    challenge_sig: &'a[u8],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,9 +84,12 @@ pub(crate) async fn do_activate_agent(
     registrar_port: u32,
     agent_uuid: &str,
     auth_tag: &str,
-    challenge_sig: Vec<u8>,
+    challenge_sig: &[u8],
 ) -> crate::error::Result<()> {
-    let data = Activate { auth_tag };
+    debug!("Authentication tag: {}", auth_tag);
+    //debug!("Challenge signature: {:?}", challenge_sig);
+    let data = Activate { auth_tag, challenge_sig };
+    debug!("Send activation request to the registrar");
 
     let remote_ip = match registrar_ip.parse::<IpAddr>() {
         Ok(addr) => {
@@ -147,7 +151,7 @@ pub(crate) async fn do_register_agent(
     mtls_cert_x509: Option<&X509>,
     ip: &str,
     port: u32,
-    pq_key: String,
+    pq_key: Vec<u8>, // &[u8] and Vec<u8> are the only data structure that have 2592 B for public key (actual size for MLDSA-87)
 ) -> crate::error::Result<Vec<u8>> {
     let mtls_cert = match mtls_cert_x509 {
         Some(cert) => Some(crate::crypto::x509_to_pem(cert)?),
@@ -183,7 +187,7 @@ pub(crate) async fn do_register_agent(
         mtls_cert,
         ip,
         port: Some(port),
-        pq_key: pq_key.clone(),
+        pq_key: pq_key,
     };
 
     debug!("Send PQ public key to the registrar");

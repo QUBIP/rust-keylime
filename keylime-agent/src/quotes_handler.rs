@@ -8,6 +8,10 @@ use crate::serialization::serialize_maybe_base64;
 use crate::{tpm, Error as KeylimeError, QuoteData};
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use base64::{engine::general_purpose, Engine as _};
+use quantcrypt::dsas::DsaAlgorithm;
+use quantcrypt::dsas::DsaKeyGenerator;
+use quantcrypt::keys::PrivateKey;
+use std::any::Any;
 use log::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -169,54 +173,61 @@ pub async fn identity(
         }
     }
 
-      // Conversione del campo quote in CString
-      let quote_ptr: *const u8 = quote.quote.as_ptr() as *const u8;
+    // Conversione del campo quote in CString
+    let quote_ptr: *const u8 = quote.quote.as_ptr() as *const u8;
 
-
-      let pq_priv_key_cstring: *const u8 = data.pq_priv_key.as_ptr();
-
-      // PQ signature
-      let result = unsafe {
-      sign_with_sphincs(quote_ptr, quote.quote.len(),pq_priv_key_cstring,data.pq_priv_key_len) 
-
-      };
-  
-      if !result.signature.is_null() {
-          // Conversion from C pointer to Rust slice
-          let signature_slice = unsafe { std::slice::from_raw_parts(result.signature, result.signature_len as usize) };
-          let signature_vec = signature_slice.to_vec();
-  
-          
-  
-      let pq_quote = PQquote {
-          sign_sphincs: signature_vec.clone(),
-          sign_sphincs_len: result.signature_len,
-          pq_key: data.pq_pub_key.clone(),
-          pq_key_len: data.pq_pub_key_len,
-          hash_alg_sphincs: "shake_256".to_string(),
-          quote_len: quote.quote.len(),
-          quote: quote.quote,
-          hash_alg: quote.hash_alg,
-          enc_alg: quote.enc_alg,
-          sign_alg: quote.sign_alg,
-          pubkey: quote.pubkey,
-          ima_measurement_list: quote.ima_measurement_list,
-          mb_measurement_list: quote.mb_measurement_list,
-          ima_measurement_list_entry: quote.ima_measurement_list_entry,
-      };
-  
-  
-      let response = JsonWrapper::success(pq_quote);
-      info!("GET integrity quote returning 200 response");
-      HttpResponse::Ok().json(response)
-  }
-
-    else{
-
-    let response = JsonWrapper::success(quote);
-    info!("GET identity quote returning 200 response");
-    HttpResponse::Ok().json(response)
+    fn print_type_of<T>(_: &T) {
+        debug!("{}", std::any::type_name::<T>());
     }
+    //let pq_priv_key_cstring: *const u8 = data.pq_priv_key.as_ptr();
+    let pq_priv_key_der = &data.pq_priv_key;
+    print_type_of(&pq_priv_key_der);
+    // debug!("------BEGIN PRIVATE KEY-----");
+    // debug!("{:?}", pq_priv_key_der);
+    // debug!("-----END PRIVATE KEY--------");
+    // let oid = DsaAlgorithm::MlDsa87.get_oid();
+
+    // match PrivateKey::new(&oid, &pq_priv_key_vec, None) {
+    //     Ok(private_key) => {
+    //         println!("Private key created successfully!");
+    //         // Use private_key here
+    //     }
+    //     Err(e) => {
+    //         eprintln!("Failed to create private key: {:?}", e);
+    //     }
+    // }
+    //info!("PQ private key type: {}", pq_priv_key);
+
+    // PQ signature
+    //   let result = unsafe {
+    //   sign_with_sphincs(quote_ptr, quote.quote.len(),pq_priv_key_cstring,data.pq_priv_key_len) 
+
+    //   };
+    
+          
+    let pq_priv_key = PrivateKey::from_der(&data.pq_priv_key).unwrap();
+    let sig_sphincs = pq_priv_key.sign(quote.quote.as_bytes()).unwrap();
+    let pq_quote = PQquote {
+        sign_sphincs: sig_sphincs,
+        sign_sphincs_len: 1024,
+        pq_key: data.pq_pub_key.to_vec(),
+        pq_key_len: data.pq_pub_key_len,
+        hash_alg_sphincs: "shake_256".to_string(),
+        quote_len: quote.quote.len(),
+        quote: quote.quote,
+        hash_alg: quote.hash_alg,
+        enc_alg: quote.enc_alg,
+        sign_alg: quote.sign_alg,
+        pubkey: quote.pubkey,
+        ima_measurement_list: quote.ima_measurement_list,
+        mb_measurement_list: quote.mb_measurement_list,
+        ima_measurement_list_entry: quote.ima_measurement_list_entry,
+    };
+    // Log the entire quote content
+    //info!("PQ signature: {:?}", pq_quote.sign_sphincs);
+    let response = JsonWrapper::success(pq_quote);
+    info!("GET integrity quote returning 200 response");
+    HttpResponse::Ok().json(response)
 }
 
 // This is a Quote request from the cloud verifier, which will check
@@ -431,31 +442,15 @@ pub async fn integrity(
         ..id_quote
     };
 
-   
-    let quote_ptr: *const u8 = quote.quote.as_ptr() as *const u8;
-    let pq_priv_key_cstring: *const u8 = data.pq_priv_key.as_ptr();
+    let pq_priv_key_der = &data.pq_priv_key;
+    let pq_priv_key = PrivateKey::from_der(pq_priv_key_der).unwrap();
+    let sig_sphincs = pq_priv_key.sign(quote.quote.as_bytes()).unwrap();
 
-
-    // Chiamata alla funzione C
-    let result = unsafe {
-        sign_with_sphincs(quote_ptr, quote.quote.len(),pq_priv_key_cstring,data.pq_priv_key_len)
-    };
-
-    if !result.signature.is_null() {
-        // Conversione dei puntatori in slice Rust
-        let signature_slice = unsafe { std::slice::from_raw_parts(result.signature, result.signature_len as usize) };
-
-        let signature_vec = signature_slice.to_vec();
-
-         // Dealloca la memoria in C
-         unsafe {
-            libc::free(result.signature as *mut libc::c_void);
-        }
 
     let pq_quote = PQquote {
-        sign_sphincs: signature_vec.clone(),
-        sign_sphincs_len: result.signature_len,
-        pq_key: data.pq_pub_key.clone(),
+        sign_sphincs: sig_sphincs,
+        sign_sphincs_len: 1025,
+        pq_key: data.pq_pub_key.to_vec(),
         pq_key_len: data.pq_pub_key_len,
         hash_alg_sphincs: "shake_256".to_string(),
         quote_len: quote.quote.len(),
@@ -477,21 +472,13 @@ pub async fn integrity(
 
     // Printing each field
     // info!("Size of quote = {} bytes", size_of::<PQquote>().to_string());
-    info!("Size of PQ signature = {} bytes", pq_quote.sign_sphincs_len.to_string());
-    info!("PQ Key Length = {} bytes", pq_quote.pq_key_len.to_string());
+    // info!("Size of PQ signature = {} bytes", pq_quote.sign_sphincs_len.to_string());
+    // info!("PQ Key Length = {} bytes", pq_quote.pq_key_len.to_string());
     // info!("Quote Length = {} bytes", pq_quote.quote_len.to_string());
     let response = JsonWrapper::success(pq_quote);
     info!("GET integrity quote returning 200 response");
     info!("Send integrity quote to the verifier");
     HttpResponse::Ok().json(response)
-}
-
- else {
-    let response = JsonWrapper::success(quote);
-    info!("GET integrity quote returning 200 response");
-    HttpResponse::Ok().json(response)
-    }
-
 }
 
 #[cfg(feature = "testing")]

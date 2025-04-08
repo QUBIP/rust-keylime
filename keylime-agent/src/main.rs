@@ -98,6 +98,7 @@ use libc::size_t;
 use std::ffi::CString;
 use quantcrypt::dsas::DsaAlgorithm;
 use quantcrypt::dsas::DsaKeyGenerator;
+use quantcrypt::keys::PrivateKey;
 
 // Generate PQ keypair
 #[link(name = "gen_keypair")]
@@ -750,56 +751,34 @@ async fn main() -> Result<()> {
         warn!("mTLS disabled, Tenant and Verifier will reach out to agent via HTTP");
     }
 
-
-
-    //Creazione delle chiavi sphincs
-    let mut pq_key_base64 = String::new();
-    
-    // Chiamata alla funzione C per generare le chiavi
-    let pq_result = unsafe {
-        generate_sphincs_keypair()
-    };
-    
-            // Trasformare i puntatori in Vec<u8>
-    let public_key_vec = unsafe {
-        if !pq_result.public_key.is_null() {
-            Vec::from(std::slice::from_raw_parts(
-                pq_result.public_key,
-                pq_result.public_key_len,
-            ))
-        } else {
-            Vec::new() // Restituisce un vettore vuoto se il puntatore è nullo
-        }
-    };
-
-    let private_key_vec = unsafe {
-        if !pq_result.private_key.is_null() {
-            Vec::from(std::slice::from_raw_parts(
-                pq_result.private_key,
-                pq_result.private_key_len,
-            ))
-        } else {
-            Vec::new()
-        }
-    };
-    let pq_key_base64: String = general_purpose::STANDARD.encode(&public_key_vec);
-    
-    // Liberazione della memoria allocata dal lato C
-    unsafe {
-        libc::free(pq_result.public_key as *mut _);
-    }
     
     // PQ key generation with quantcrypt crate
-    let mut key_generator = DsaKeyGenerator::new(DsaAlgorithm::MlDsa65);
+    let mut key_generator = DsaKeyGenerator::new(DsaAlgorithm::MlDsa87);
     let (pq_pub_key, pq_priv_key) = key_generator.generate().unwrap();
-    let pq_pk_b64: String = general_purpose::STANDARD.encode((&pq_pub_key).get_key());
+    // pq_pub_key is dropped at the end of current scope
+    // for MLDSA-87 the expected public key is 2592 B
+    let pq_sk_der = pq_priv_key.to_der().unwrap();
+    let pq_pk_der = pq_pub_key.to_der().unwrap(); // 2614 B
+    let pq_pk_pem = pq_pub_key.to_pem().unwrap(); // 3595 B
+    let pq_pk_u8 = pq_pub_key.get_key(); //2592 B
+    let pq_pk_vec: Vec<u8> = pq_pub_key.get_key().to_vec(); // Own the bytes
+    let pq_pk_str = pq_pub_key.to_pem().unwrap(); // 3595 B
     fn print_type_of<T>(_: &T) {
-        println!("{}", std::any::type_name::<T>());
+        debug!("{}", std::any::type_name::<T>());
     }
-    debug!("PQ Public KEY");
-    debug!("-----Begin Public KEY-----");
-    debug!("{}", pq_pk_b64.clone());
-    debug!("-----End Public KEY-----");
+    debug!("PQ public key vec length: {}", pq_pk_vec.len()); // 2592 B
+    debug!("PQ public key str length: {}", pq_pk_str.len());
+    debug!("PQ public key der length: {}", pq_pk_der.len());
+    debug!("PQ public key u8 length: {}", pq_pk_u8.len());
+    debug!{"PQ public key pem length: {}", pq_pk_pem.len()};
+    debug!("-----BEGIN PUBLIC KEY-----");
+    debug!("{:?}", pq_pk_pem);
+    debug!("-----END PUBLIC KEY-----");
+    // print_type_of(&pq_priv_key);
+    // debug!("PQ Private KEY");
+    // debug!("------BEGIN PRIVATE KEY-----");
+    // debug!("{:?}", pq_sk_der);
+    // debug!("-----END PRIVATE KEY--------");
 
 
     {
@@ -839,7 +818,7 @@ async fn main() -> Result<()> {
                 mtls_cert,
                 config.agent.contact_ip.as_ref(),
                 config.agent.contact_port,
-                pq_pk_b64.clone(),
+                pq_pk_vec.clone(),
             )
             .await?
         } else {
@@ -860,7 +839,7 @@ async fn main() -> Result<()> {
                 mtls_cert,
                 config.agent.contact_ip.as_ref(),
                 config.agent.contact_port,
-                pq_pk_b64.clone(),
+                pq_pk_vec.clone(),
             )
             .await?
         };
@@ -883,16 +862,16 @@ async fn main() -> Result<()> {
             crypto::compute_hmac(mackey.as_bytes(), agent_uuid.as_bytes())?;
         let auth_tag = hex::encode(&auth_tag);
         info!("AUTH TAG: {}", auth_tag);
-        let challenge_sig = pq_priv_key.sign(&auth_tag.as_bytes()).unwrap();
+        let challenge_sig = pq_priv_key.sign(&auth_tag.as_bytes()).unwrap().to_vec();
         // print_type_of(&challenge_sig);
         info!("Computed PQ signature over auth tag");
-        // info!("PQ SIGNATURE OVER AUTH TAG: {:?}", challenge_sig);
+       // info!("PQ SIGNATURE OVER AUTH TAG: {:?}", challenge_sig);
         registrar_agent::do_activate_agent(
             config.agent.registrar_ip.as_ref(),
             config.agent.registrar_port,
             &agent_uuid,
             &auth_tag,
-            challenge_sig
+            &challenge_sig
             
         )
         .await?;
@@ -968,10 +947,10 @@ async fn main() -> Result<()> {
         measuredboot_ml_file,
         ima_ml: Mutex::new(MeasurementList::new()),
         secure_mount: PathBuf::from(&mount),
-        pq_pub_key: public_key_vec,
-        pq_pub_key_len: pq_result.public_key_len,
-        pq_priv_key: private_key_vec, 
-        pq_priv_key_len: pq_result.private_key_len,
+        pq_pub_key: pq_pk_vec,
+        pq_pub_key_len: 1024,
+        pq_priv_key: pq_sk_der, 
+        pq_priv_key_len: 1024,
     });
 
     let actix_server =

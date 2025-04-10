@@ -72,7 +72,7 @@ pub(crate) struct KeylimeQuote {
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub(crate) struct PQquote {
     pub sign_sphincs: Vec<u8>, 
-    pub sign_sphincs_len: c_ulong,
+    pub sign_sphincs_len: usize,
     pub pq_key: Vec<u8>, 
     pub pq_key_len: usize,
     pub hash_alg_sphincs: String,
@@ -208,8 +208,8 @@ pub async fn identity(
     let pq_priv_key = PrivateKey::from_der(&data.pq_priv_key).unwrap();
     let sig_sphincs = pq_priv_key.sign(quote.quote.as_bytes()).unwrap();
     let pq_quote = PQquote {
-        sign_sphincs: sig_sphincs,
-        sign_sphincs_len: 1024,
+        sign_sphincs: sig_sphincs.clone(),
+        sign_sphincs_len: sig_sphincs.len(),
         pq_key: data.pq_pub_key.to_vec(),
         pq_key_len: data.pq_pub_key_len,
         hash_alg_sphincs: "shake_256".to_string(),
@@ -448,10 +448,10 @@ pub async fn integrity(
 
 
     let pq_quote = PQquote {
-        sign_sphincs: sig_sphincs,
-        sign_sphincs_len: 1025,
+        sign_sphincs: sig_sphincs.clone(),
+        sign_sphincs_len: sig_sphincs.len(),
         pq_key: data.pq_pub_key.to_vec(),
-        pq_key_len: data.pq_pub_key_len,
+        pq_key_len: data.pq_pub_key.len(),
         hash_alg_sphincs: "shake_256".to_string(),
         quote_len: quote.quote.len(),
         quote: quote.quote,
@@ -471,10 +471,10 @@ pub async fn integrity(
 
 
     // Printing each field
-    // info!("Size of quote = {} bytes", size_of::<PQquote>().to_string());
-    // info!("Size of PQ signature = {} bytes", pq_quote.sign_sphincs_len.to_string());
-    // info!("PQ Key Length = {} bytes", pq_quote.pq_key_len.to_string());
-    // info!("Quote Length = {} bytes", pq_quote.quote_len.to_string());
+    info!("Size of quote = {} bytes", size_of::<PQquote>().to_string());
+    info!("Size of PQ signature = {} bytes", pq_quote.sign_sphincs_len.to_string());
+    info!("PQ Key Length = {} bytes", pq_quote.pq_key_len.to_string());
+    info!("Quote Length = {} bytes", pq_quote.quote_len.to_string());
     let response = JsonWrapper::success(pq_quote);
     info!("GET integrity quote returning 200 response");
     info!("Send integrity quote to the verifier");

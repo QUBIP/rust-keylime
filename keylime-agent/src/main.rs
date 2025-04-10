@@ -770,10 +770,20 @@ async fn main() -> Result<()> {
     debug!("PQ public key str length: {}", pq_pk_str.len());
     debug!("PQ public key der length: {}", pq_pk_der.len());
     debug!("PQ public key u8 length: {}", pq_pk_u8.len());
-    debug!{"PQ public key pem length: {}", pq_pk_pem.len()};
-    debug!("-----BEGIN PUBLIC KEY-----");
+    debug!("PQ public key pem length: {}", pq_pk_pem.len());
+    debug!("PQ PUBLIC KEY AS STR");
+    debug!("-------------------------");
+    debug!("{:?}", pq_pk_str);
+    debug!("PQ PUBLIC KEY AS VEC<U8>");
+    debug!("-------------------------");
+    debug!("{:?}", pq_pk_vec);
+    // debug!("PQ PUBLIC KEY AS DER");
+    // debug!("-------------------------");
+    // debug!("{:?}", pq_pk_der);
+    debug!("PQ PUBLIC KEY AS PEM");
+    debug!("-------------------------");
     debug!("{:?}", pq_pk_pem);
-    debug!("-----END PUBLIC KEY-----");
+    
     // print_type_of(&pq_priv_key);
     // debug!("PQ Private KEY");
     // debug!("------BEGIN PRIVATE KEY-----");
@@ -865,6 +875,7 @@ async fn main() -> Result<()> {
         let challenge_sig = pq_priv_key.sign(&auth_tag.as_bytes()).unwrap().to_vec();
         // print_type_of(&challenge_sig);
         info!("Computed PQ signature over auth tag");
+        debug!("Size of PQ signature over auth tag: {}", challenge_sig.len()); // should be 4627 B for MLdsa-87
        // info!("PQ SIGNATURE OVER AUTH TAG: {:?}", challenge_sig);
         registrar_agent::do_activate_agent(
             config.agent.registrar_ip.as_ref(),

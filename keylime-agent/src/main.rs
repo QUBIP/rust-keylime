@@ -607,7 +607,7 @@ async fn main() -> Result<()> {
         path => agent_data_new.store(Path::new(&path))?,
     }
 
-    debug!("Hash of Endorsement Key used as UUID");
+    debug!("Hash of TPM's Endorsement Key used as UUID");
     debug!("Agent UUID: {}", agent_uuid);
 
     let (attest, signature) = if config.agent.enable_iak_idevid {
@@ -766,23 +766,24 @@ async fn main() -> Result<()> {
     fn print_type_of<T>(_: &T) {
         debug!("{}", std::any::type_name::<T>());
     }
-    debug!("PQ public key vec length: {}", pq_pk_vec.len()); // 2592 B
-    debug!("PQ public key str length: {}", pq_pk_str.len());
-    debug!("PQ public key der length: {}", pq_pk_der.len());
-    debug!("PQ public key u8 length: {}", pq_pk_u8.len());
-    debug!("PQ public key pem length: {}", pq_pk_pem.len());
-    debug!("PQ PUBLIC KEY AS STR");
-    debug!("-------------------------");
-    debug!("{:?}", pq_pk_str);
-    debug!("PQ PUBLIC KEY AS VEC<U8>");
-    debug!("-------------------------");
-    debug!("{:?}", pq_pk_vec);
+    debug!("Post-Quantum (PQ) keypair generated with MLDSA-87 algorithm");
+    debug!("PQ public key length: {}", pq_pk_vec.len()); // 2592 B
+    // debug!("PQ public key str length: {}", pq_pk_str.len());
+    // debug!("PQ public key der length: {}", pq_pk_der.len());
+    // debug!("PQ public key u8 length: {}", pq_pk_u8.len());
+    // debug!("PQ public key pem length: {}", pq_pk_pem.len());
+    // debug!("PQ PUBLIC KEY AS STR");
+    // debug!("-------------------------");
+    // debug!("{:?}", pq_pk_str);
+    // debug!("PQ PUBLIC KEY AS VEC<U8>");
+    // debug!("-------------------------");
+    // debug!("{:?}", pq_pk_vec);
     // debug!("PQ PUBLIC KEY AS DER");
     // debug!("-------------------------");
     // debug!("{:?}", pq_pk_der);
-    debug!("PQ PUBLIC KEY AS PEM");
-    debug!("-------------------------");
-    debug!("{:?}", pq_pk_pem);
+    // debug!("PQ PUBLIC KEY AS PEM");
+    // debug!("-------------------------");
+    // debug!("{:?}", pq_pk_pem);
     
     // print_type_of(&pq_priv_key);
     // debug!("PQ Private KEY");
@@ -871,11 +872,12 @@ async fn main() -> Result<()> {
         let auth_tag =
             crypto::compute_hmac(mackey.as_bytes(), agent_uuid.as_bytes())?;
         let auth_tag = hex::encode(&auth_tag);
-        info!("AUTH TAG: {}", auth_tag);
+
+        //info!("AUTH TAG: {}", auth_tag);
         let challenge_sig = pq_priv_key.sign(&auth_tag.as_bytes()).unwrap().to_vec();
         // print_type_of(&challenge_sig);
         info!("Computed PQ signature over auth tag");
-        debug!("Size of PQ signature over auth tag: {}", challenge_sig.len()); // should be 4627 B for MLdsa-87
+        debug!("Size of PQ signature over auth tag: {} B", challenge_sig.len()); // should be 4627 B for MLdsa-87
        // info!("PQ SIGNATURE OVER AUTH TAG: {:?}", challenge_sig);
         registrar_agent::do_activate_agent(
             config.agent.registrar_ip.as_ref(),

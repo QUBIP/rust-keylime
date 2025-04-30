@@ -8,4 +8,7 @@ tests/unzipped/__pycache__
 *.so
 *.crt
 *.json
+*.pem
 *.pub
+*.cer
+*.crt
